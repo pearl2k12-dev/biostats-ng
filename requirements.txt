@@ -7,3 +7,4 @@ openpyxl
 gspread
 oauth2client
 requests
+statsmodels
