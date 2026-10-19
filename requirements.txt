@@ -4,4 +4,6 @@ python-docx
 matplotlib
 scipy
 openpyxl
-lxml
+gspread
+oauth2client
+requests
