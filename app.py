@@ -237,4 +237,25 @@ with tab5:
     up_review=st.file_uploader("Or Upload Docx", type=["docx"], key="rev_up")
     if st.button("Submit for Review"):
         if not work_text and not up_review: st.error("Paste work")
-        elif not student_email: st.error("Enter
+        elif not student_email: st.error("Enter email in top")
+        else:
+            content=work_text + (f" [File:{up_review.name}]" if up_review else "")
+            row=[datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), uni, dept, project_title, student_email, content[:3000], verify_code, ""]
+            save_review(row); st.success(f"✅ Submitted! Code {verify_code} — saved to Google Sheet")
+    st.divider(); st.subheader("🔔 Check Feedback")
+    check=st.text_input("Enter verification code")
+    if check:
+        sh=get_sheet()
+        if sh:
+            try:
+                rev_df=pd.DataFrame(sh.worksheet("Reviews").get_all_records())
+                found=rev_df[rev_df['verify']==check]
+                if found.empty: st.warning("No submission for this code in Sheet")
+                else:
+                    for _,r in found.iterrows():
+                        if str(r.get("feedback","")).strip(): st.success(f"Feedback from Admin: {r['feedback']}")
+                        else: st.info("Submitted — Admin not yet feedback, check later")
+            except Exception as e: st.error(f"Sheet read error: {e}")
+
+st.divider()
+st.markdown(f"<div style='text-align:center; font-size:11px; color:gray;'><b>{BUSINESS_NAME}</b><br>{BUSINESS_EMAIL} | {VERIFY_DOMAIN}<br>Works with Consensus.ai + Jenni.ai | Paystack + Google Sheet Live | © 2026</div>", unsafe_allow_html=True)
