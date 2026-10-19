@@ -33,7 +33,7 @@ UNI_GUIDELINES={
 "Default":{"font":"Times New Roman","size":12,"spacing":2.0,"margins":"1 inch","chapter_style":"CHAPTER ONE"}
 }
 
-PRICE_TIERS = {"Basic - ₦30,000 (Analyse + Format)": {"amount": 3000000, "display": 30000}, "Standard - ₦40,000 (Most Popular)": {"amount": 4000000, "display": 40000}}
+PRICE_TIERS = {"Basic - ₦30,000 (Analyse + Format)": {"amount": 10000, "display": 30}} # 10000 kobo = ₦100 for test
 REF_STYLES = ["APA 7th","APA 6th","MLA 9th","Chicago","Harvard","Vancouver","IEEE","AMA","ASA","Turabian","Oxford"]
 FONT_OPTIONS = ["Times New Roman","Arial","Calibri","Cambria"]; SIZE_OPTIONS = [10,11,12,13,14]; SPACING_OPTIONS = [1.0,1.15,1.5,2.0]; MARGIN_OPTIONS = ["1 inch (Standard)","1.5 inch","1 inch left, 1.5 inch others"]; CHAPTER_OPTIONS = ["CHAPTER ONE - Center Bold","Chapter One - Center","CHAPTER 1","1.0 Introduction"]
 
