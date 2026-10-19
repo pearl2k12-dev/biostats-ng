@@ -1,139 +1,206 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy import stats
 import hashlib
+from io import BytesIO
+import docx
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+import json
 from datetime import datetime
 
-st.set_page_config(page_title="BioStats NG - FYP Co-Pilot", layout="wide", page_icon="🇳🇬")
-if 'paid' not in st.session_state:
-    st.session_state.paid = False
-if 'uploaded_df' not in st.session_state:
-    st.session_state.uploaded_df = None
+st.set_page_config(page_title="BioStats NG - Admin + Student", layout="wide", page_icon="🇳🇬")
 
-st.markdown("""
-<style>
-.big-title {font-size:26px; font-weight:800; color:#0A1931;}
-.locked {background:#FFF3CD; border:1px solid #FFC107; padding:12px; border-radius:10px;}
-.paid {background:#D4EDDA; border:1px solid #28A745; padding:12px; border-radius:10px;}
-.card {background:#F8FAFF; border:1px solid #DDE6FF; padding:10px; border-radius:10px;}
-</style>
-""", unsafe_allow_html=True)
+# --- ADMIN CONFIG ---
+ADMIN_PASSWORD = "admin123"  # CHANGE THIS TO YOUR OWN PASSWORD
+if 'paid' not in st.session_state: st.session_state.paid=False
+if 'is_admin' not in st.session_state: st.session_state.is_admin=False
+if 'payments' not in st.session_state: st.session_state.payments=[]
 
-st.markdown('<div class="big-title">BioStats NG — FYP Co-Pilot 🇳🇬</div>', unsafe_allow_html=True)
-st.write("Upload YOUR lab data. See 10% real preview FREE. Pay ₦30k to unlock 100% + SPSS + QR verification.")
-
+UNIVERSITIES = ["UNIPORT","RSU","UNILAG","UI","UNN","UNIBEN","DELSU","Other"]
+DEPARTMENTS = ["Physiology","Biochemistry","Anatomy","Pharmacology","Microbiology","Medical Lab Science","Nursing","Public Health","Other"]
 UNI_RULES = {
-"UNIPORT - Physiology": {"font":"Times 12","spacing":"2.0","stats":"ANOVA+Tukey","ethical":"UNIPORT Ethics"},
-"RSU - Physiology": {"font":"Times 12","spacing":"1.5","stats":"ANOVA+Dunnett","ethical":"RSU Ethics"},
-"UNILAG - Physiology": {"font":"Arial 11","spacing":"1.5","stats":"ANOVA+Tukey","ethical":"CMUL/HREC"},
-"UI - Physiology": {"font":"Times 12","spacing":"2.0","stats":"ANOVA","ethical":"UI/UCH Ethics"},
-"UNN - Physiology": {"font":"Times 12","spacing":"1.5","stats":"t-test/ANOVA","ethical":"UNN Ethics"},
-"Other": {"font":"Times 12","spacing":"2.0","stats":"ANOVA+Tukey","ethical":"Dept Ethics"}
+"UNIPORT": {"font_name":"Times New Roman","font_size":12,"spacing":2.0},
+"RSU": {"font_name":"Times New Roman","font_size":12,"spacing":1.5},
+"UNILAG": {"font_name":"Arial","font_size":11,"spacing":1.5},
+"UI": {"font_name":"Times New Roman","font_size":12,"spacing":2.0},
+"Default": {"font_name":"Times New Roman","font_size":12,"spacing":2.0}
 }
 
-with st.sidebar:
-    st.header("Student")
-    uni = st.selectbox("University", list(UNI_RULES.keys()))
-    matric = st.text_input("Matric No", placeholder="U2020/123456")
-    topic = st.text_input("Project Topic", "")
-    rule = UNI_RULES[uni]
-    st.markdown(f'<div class="card"><b>{uni}</b><br>{rule["stats"]}<br>{rule["ethical"]}</div>', unsafe_allow_html=True)
-    st.divider()
-    if not st.session_state.paid:
-        st.markdown('<div class="locked">🔒 FREE MODE<br>You see 10% of YOUR data<br>Pay ₦30k for 100%</div>', unsafe_allow_html=True)
-        if st.button("💳 Pay ₦30k (Test Paystack)"):
-            if not matric:
-                st.error("Enter Matric No")
-            else:
-                st.session_state.paid = True
-                st.rerun()
-    else:
-        st.markdown(f'<div class="paid">✅ PAID — {matric}<br>100% data + QR + Human review</div>', unsafe_allow_html=True)
-        if st.button("Log out to FREE"):
-            st.session_state.paid = False
+# Top bar
+col1, col2 = st.columns([4,1])
+with col1:
+    st.markdown('<div style="font-size:26px;font-weight:800;color:#0A1931;">BioStats NG — Student + Admin 🇳🇬</div>', unsafe_allow_html=True)
+with col2:
+    if st.button("🔑 Admin Dashboard" if not st.session_state.is_admin else "👨🎓 Back to Student View"):
+        if not st.session_state.is_admin:
+            st.session_state.show_admin_login=True
+        else:
+            st.session_state.is_admin=False
             st.rerun()
 
-tab1, tab2, tab3, tab4 = st.tabs(["📸 Scanner","📊 Chapter 4","📝 Discussion & Format","🎤 Defense"])
+if st.session_state.get('show_admin_login', False) and not st.session_state.is_admin:
+    pwd = st.text_input("Enter Admin Password", type="password")
+    if st.button("Login as Admin"):
+        if pwd == ADMIN_PASSWORD:
+            st.session_state.is_admin=True
+            st.session_state.show_admin_login=False
+            st.rerun()
+        else:
+            st.error("Wrong password")
+
+# ================= ADMIN DASHBOARD =================
+if st.session_state.is_admin:
+    st.divider()
+    st.subheader("📊 ADMIN DASHBOARD — Only You See This")
+    st.write("This is hidden from students. They cannot see this page.")
+
+    total = len(st.session_state.payments)
+    st.metric("Total Paid Students (Test Mode)", total)
+
+    if total==0:
+        st.info("No payments yet in test. Click 'Pay ₦30k (Test)' in student view to simulate.")
+    else:
+        df_pay = pd.DataFrame(st.session_state.payments)
+        st.dataframe(df_pay)
+        st.download_button("Download All Payments CSV", df_pay.to_csv(index=False), "payments.csv")
+
+    colA, colB = st.columns(2)
+    with colA:
+        st.write("**Payments by University**")
+        if total>0:
+            st.bar_chart(pd.DataFrame(st.session_state.payments)['uni'].value_counts())
+    with colB:
+        st.write("**Payments by Department**")
+        if total>0:
+            st.bar_chart(pd.DataFrame(st.session_state.payments)['dept'].value_counts())
+
+    st.divider()
+    st.write("**Verification Checker**")
+    check = st.text_input("Enter verification code to check student")
+    if check:
+        found = [p for p in st.session_state.payments if p['verify']==check.upper()]
+        if found:
+            st.success(f"FOUND: {found}")
+        else:
+            st.error("Not found in test payments")
+
+    st.divider()
+    if st.button("Clear All Test Payments (Reset)"):
+        st.session_state.payments=[]
+        st.rerun()
+    st.stop()
+
+# ================= STUDENT VIEW =================
+with st.sidebar:
+    st.header("Student Details")
+    uni = st.selectbox("University Name Only", UNIVERSITIES)
+    dept = st.selectbox("Department (Separate)", DEPARTMENTS)
+    full_name = st.text_input("Full Name", "John A. Doe")
+    matric = st.text_input("Matric No", "U2020/123456")
+    topic = st.text_input("Project Title", "Effect of Vernonia on glucose")
+    citation_style = st.selectbox("Choose YOUR Citation Style", ["APA 7th (UNIPORT)", "APA 6th", "Vancouver [1],[2]", "MLA 9th", "Chicago Author-Date", "Harvard UNILAG"])
+    rule = UNI_RULES.get(uni, UNI_RULES["Default"])
+    st.divider()
+    if not st.session_state.paid:
+        st.markdown('<div style="background:#FFF3CD;padding:10px;border-radius:10px;">🔒 FREE<br>10% + 5 pages</div>', unsafe_allow_html=True)
+        if st.button("💳 Pay ₦30k (Test)"):
+            if not matric: st.error("Enter Matric")
+            else:
+                verify = hashlib.sha256(f"{matric}{datetime.now()}".encode()).hexdigest()[:10].upper()
+                # Save to admin dashboard
+                st.session_state.payments.append({
+"date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+"full_name": full_name,
+"matric": matric,
+"uni": uni,
+"dept": dept,
+"topic": topic,
+"citation_style": citation_style,
+"verify": verify,
+"amount": "₦30k Test"
+                })
+                st.session_state.paid=True
+                st.rerun()
+    else:
+        st.markdown(f'<div style="background:#D4EDDA;padding:10px;border-radius:10px;">✅ PAID — {matric}</div>', unsafe_allow_html=True)
+        if st.button("Back to FREE"):
+            st.session_state.paid=False
+            st.rerun()
+
+def format_citation(raw, style, idx):
+    raw=raw.strip()
+    if "APA 7th" in style: return f"{raw} → APA 7th"
+    if "Vancouver" in style: return f"[{idx}] {raw}"
+    return f"{raw} → {style}"
+
+tab1, tab2, tab3 = st.tabs(["📸 Lab Data","📝 Full Formatter","🧠 Learn to Discuss"])
 
 with tab1:
-    st.subheader("Lab Scanner — Your Real Data")
-    uploaded = st.file_uploader("Upload YOUR lab Excel (glucometer, weight, etc)", type=["xlsx","csv","jpg","png"])
-
-    if uploaded:
-        try:
-            if uploaded.name.endswith(".csv"):
-                df = pd.read_csv(uploaded)
-            else:
-                df = pd.read_excel(uploaded)
-            st.session_state.uploaded_df = df
-        except:
-            df = pd.DataFrame({"Control":[5.2,5.4,5.1,5.3,5.2,5.5,5.1,5.4,5.3,5.2],"200mg":[4.1,4.0,4.2,3.9,4.0,4.1,3.8,4.2,4.0,3.9],"400mg":[3.5,3.6,3.4,3.7,3.5,3.3,3.6,3.4,3.5,3.6]})
-            st.session_state.uploaded_df = df
-            st.info("Image detected — using extracted values preview")
-
-    if st.session_state.uploaded_df is not None:
-        df = st.session_state.uploaded_df
-        total_rows = len(df)
-        preview_rows = max(2, int(total_rows * 0.1))
-
+    st.subheader(f"{uni} — {dept} — Lab Data")
+    up = st.file_uploader("Upload lab Excel", type=["xlsx","csv"])
+    if up:
+        df = pd.read_csv(up) if up.name.endswith(".csv") else pd.read_excel(up)
+        total=len(df); preview=max(2,int(total*0.1))
         if not st.session_state.paid:
-            st.warning(f"FREE: You uploaded {total_rows} rows. Showing {preview_rows} rows only (10%) from YOUR data.")
-            st.dataframe(df.head(preview_rows))
-            st.markdown(f'<div class="locked">🔒 {total_rows - preview_rows} rows hidden + SPSS + QR hidden. These {preview_rows} rows are YOUR real data, but incomplete — supervisor will reject. Pay ₦30k to unlock all {total_rows} rows.</div>', unsafe_allow_html=True)
-            free_csv = f"# PREVIEW {preview_rows}/{total_rows} rows — Pay ₦30k for full — {matric}\n" + df.head(preview_rows).to_csv(index=False)
-            st.download_button(f"Download FREE Preview ({preview_rows} rows only)", free_csv, "FREE_PREVIEW_10percent.csv")
+            st.warning(f"FREE: {total} rows, showing {preview}")
+            st.dataframe(df.head(preview))
         else:
-            st.success(f"PAID: Unlocking all {total_rows} rows from YOUR upload")
-            verify = hashlib.sha256(f"{matric}{uni}{datetime.now().date()}".encode()).hexdigest()[:10].upper()
+            st.success(f"PAID: All {total} rows")
             st.dataframe(df)
-            st.code(f"Verification hash: {verify} — biostats.ng/verify/{verify}")
-            full_csv = f"# VERIFIED {matric} {uni} {verify} Full {total_rows} rows\n" + df.to_csv(index=False)
-            st.download_button(f"Download FULL {total_rows} rows (verified)", full_csv, f"{matric}_FULL_{total_rows}rows.csv")
-    else:
-        st.info("Upload your lab file to see 10% real preview. No fake demo.")
 
 with tab2:
-    st.subheader(f"Chapter 4 Analysis — {rule['stats']}")
-    if st.session_state.uploaded_df is not None:
-        df = st.session_state.uploaded_df
-        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()[:3]
-        if len(num_cols)>=2:
-            f_val,p_val = stats.f_oneway(*[df[c].dropna() for c in num_cols])
-            st.metric("ANOVA from YOUR data", f"F={f_val:.2f}, p={p_val:.4f}")
-            fig, ax = plt.subplots()
-            df[num_cols].mean().plot(kind='bar', yerr=df[num_cols].std(), capsize=4, ax=ax)
-            ax.set_title("YOUR data (preview)" if not st.session_state.paid else f"YOUR data — Verified {matric}")
-            st.pyplot(fig)
-            if not st.session_state.paid:
-                st.markdown('<div class="locked">🔒 FREE: low-res + no SPSS + no QR. Pay ₦30k.</div>', unsafe_allow_html=True)
-            else:
-                verify = hashlib.sha256(f"{matric}".encode()).hexdigest()[:10]
-                spss = f"* VERIFIED {matric} {uni} {verify} — FROM YOUR UPLOAD\nONEWAY {''.join(num_cols)} /POSTHOC={rule['stats']}."
-                st.code(spss)
-                st.download_button("Download SPSS Syntax (YOUR data, verified)", spss, "SPSS_VERIFIED_YOUR_DATA.sps")
-    else:
-        st.info("Upload data in Scanner tab first.")
+    st.subheader(f"Formatter — {uni} + {dept} + {citation_style}")
+    doc_up = st.file_uploader("Upload thesis .docx", type=["docx"])
+    cite_text = st.text_area("References (one per line)", "Oguntola 2020 diabetes\nAdeola 2021 vernonia")
+    if doc_up:
+        file_bytes=doc_up.read()
+        def build(file_bytes, is_paid):
+            src=docx.Document(BytesIO(file_bytes))
+            new_doc=docx.Document()
+            p=new_doc.add_paragraph(); p.alignment=WD_ALIGN_PARAGRAPH.CENTER; r=p.add_run(f"{topic.upper()}\n\n{full_name.upper()}\n{matric}\n\n{dept}\n{uni}\n"); r.font.name=rule['font_name']
+            new_doc.add_page_break()
+            new_doc.add_heading("TABLE OF CONTENTS",1)
+            for para in src.paragraphs[:10]:
+                if para.text.strip(): new_doc.add_paragraph(para.text[:80], style='List Bullet')
+            new_doc.add_page_break()
+            limit=9999 if is_paid else 50
+            for i, para in enumerate(src.paragraphs):
+                if i>limit and not is_paid:
+                    new_doc.add_paragraph(f"[LOCKED — Pay ₦30k]"); break
+                p=new_doc.add_paragraph(); p.paragraph_format.line_spacing=rule['spacing']; p.text=para.text
+                for run in p.runs: run.font.name=rule['font_name']; run.font.size=Pt(rule['font_size'])
+            cites=[c.strip() for c in cite_text.split("\n") if c.strip()]
+            refs=[format_citation(c,citation_style,i+1) for i,c in enumerate(cites)]
+            if not is_paid: refs=refs[:2]+[f"[+{len(cites)-2} locked]"]
+            new_doc.add_page_break()
+            new_doc.add_heading(f"REFERENCES ({citation_style})",1)
+            for r in refs: new_doc.add_paragraph(r, style='List Bullet')
+            verify=hashlib.sha256(f"{matric}".encode()).hexdigest()[:10].upper()
+            new_doc.add_paragraph(f"Verified {matric} {uni} {dept} {verify} {citation_style}")
+            out=BytesIO(); new_doc.save(out); return out.getvalue(), refs, verify
+        if not st.session_state.paid:
+            fb, refs, ver = build(file_bytes, False)
+            st.warning(f"FREE: 5 pages + 2 refs {citation_style}")
+            st.download_button("Download FREE preview", fb, "FREE.docx")
+        else:
+            fb, refs, ver = build(file_bytes, True)
+            st.success(f"PAID: Full {uni} {dept} {citation_style} {ver}")
+            st.download_button("Download FULL", fb, f"{matric}_FULL.docx")
 
 with tab3:
-    st.subheader("Discussion & Format — 10% Preview")
-    finding = st.text_input("What did YOUR result show?", "400mg reduced glucose p<0.001 in MY data")
-    if st.button("Generate from MY data"):
-        if not st.session_state.paid:
-            st.write(f"**FREE — 2 lines from YOUR finding:** {finding}. This was observed in your uploaded dataset...")
-            st.markdown('<div class="locked">🔒 Full 500 words + 5 Nigerian citations locked. Pay ₦30k.</div>', unsafe_allow_html=True)
-            st.error(f"FREE Format: 2 of 8 errors shown — Font {rule['font']}. 6 hidden. Pay ₦30k to auto-fix.")
-        else:
-            st.markdown(f"**FULL — YOUR data — Verified {matric}**\n\n{finding}. Aligns with YOUR uploaded control vs test mean difference.\n\nVerification: {matric}")
-
-with tab4:
-    st.subheader("Defense — Unstealable")
-    st.write("Watermark remover can remove picture, but cannot create 90% of YOUR data + QR + Human review")
+    st.subheader("Learn to Discuss — Teach Mode")
+    finding = st.text_input("What did result show?", "400mg reduced glucose")
     if not st.session_state.paid:
-        st.markdown('<div class="locked">🔒 Defense questions + Human review locked. Pay ₦30k.</div>', unsafe_allow_html=True)
+        st.info(f"FREE Step 1: You saw {finding}. Write 1 sentence why it matters. Steps 2-4 locked.")
     else:
-        st.success(f"PAID — Human review for {matric} unlocked")
-        st.code(f"1. Explain YOUR ANOVA {rule['stats']}\n2. Where is {rule['ethical']}?\n3. Why 200mg failed but 400mg worked?\n4. NUC sample size justification?")
-
-st.caption("Model: Free = 10% of YOUR real upload. Paid = 100% + SPSS + QR + hash. Removing watermark leaves them with only 10% — useless.")
+        st.success("PAID — Full teaching")
+        st.markdown(f"""
+        **Step 1:** {finding} → Say "mean dropped from X to Y"
+        **Step 2:** Compare in {citation_style}
+        **Step 3:** Mechanism for {dept}
+        **Step 4:** Limitations
+        Write yourself, then defend.
+""")
+        draft = st.text_area("Paste YOUR paragraph")
+        if st.button("Grade my paragraph"):
+            st.success("Good — now formatted for defense.")
