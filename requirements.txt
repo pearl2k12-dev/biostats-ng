@@ -1,4 +1,6 @@
 streamlit
-google-generativeai
 pandas
 numpy
+matplotlib
+scipy
+openpyxl
