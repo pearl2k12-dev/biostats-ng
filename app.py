@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd, requests, datetime, random, string, io, os, re, tempfile, hmac
 from urllib.parse import quote_plus
@@ -480,7 +481,9 @@ st.markdown(f"""
 .hero {{background: radial-gradient(circle at 90% 10%, rgba(59,130,246,.42), transparent 30%), linear-gradient(125deg, #102A43 0%, #163D70 60%, #1D4ED8 100%); padding: clamp(28px, 5vw, 58px) clamp(20px, 4vw, 54px); border-radius: 24px; color: white; text-align: left; margin: 12px 0 22px; box-shadow: 0 18px 44px rgba(16,42,67,.16); }}
 .hero h1 {{ font-size: clamp(2rem, 4vw, 3.2rem); line-height: 1.08; letter-spacing: -0.04em; max-width: 800px; margin-bottom: 16px; }}
 .hero p {{ font-size: 1.08rem; line-height: 1.65; color: #E6EEF8; max-width: 760px; }}
-.app-name {{font-size:17px; font-weight:850; color:#102A43; letter-spacing:.2px; background:#F0F6FF; border:1px solid #D8E6FA; border-radius:14px; padding:9px 15px; display:inline-block; margin-bottom:8px;}}
+.app-name {{font-size:17px; line-height:1.5; font-weight:850; color:#102A43 !important; letter-spacing:.2px; background:#F0F6FF; border:1px solid #D8E6FA; border-radius:14px; padding:12px 16px; display:inline-flex; align-items:center; flex-wrap:wrap; gap:5px; margin:0 0 18px 0; max-width:100%; box-sizing:border-box; overflow:visible;}}
+.app-name span {{color:#526579 !important; line-height:1.5;}}
+.rbhq-brandbar {{display:block; width:100%; margin:0 0 18px 0; padding:4px 0 2px 0; line-height:1.6; overflow:visible;}}
 .locked-box {{background:#F8FAFC; border:1px solid #CBD5E1; border-radius:14px; padding:22px; text-align:center; margin:15px 0; color:#334155;}}
 .price-card {{border: 1px solid #D9E2EC; border-radius: 18px; padding: 24px; background: white; color:#172B4D; min-height:100%; box-shadow:0 4px 16px rgba(16,42,67,.04);}}
 .price-card.popular {{border: 2px solid #2563EB; box-shadow: 0 12px 30px rgba(37,99,235,.12);}}
@@ -735,7 +738,7 @@ if "pay_notice" in st.session_state: st.warning(st.session_state.pop("pay_notice
 if st.session_state.pop("just_paid", False): st.balloons()
 
 # ---------------------------------------------------------------- HEADER / CONVERSION LANDING PAGE
-st.markdown(f"<div style='text-align:left;'><span class='app-name'>📘 {APP_NAME} <span style='font-weight:500;color:#526579'>· Research workflow workspace</span></span></div>", unsafe_allow_html=True)
+st.markdown(f"<div class='rbhq-brandbar'><div class='app-name'><span style='font-size:19px;line-height:1.5;'>📘 {APP_NAME}</span><span style='font-weight:500;color:#526579 !important;'>· Research workflow workspace</span></div></div>", unsafe_allow_html=True)
 
 if not st.session_state.paid:
     st.markdown(f"""
