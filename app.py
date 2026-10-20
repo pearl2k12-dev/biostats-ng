@@ -1,5 +1,6 @@
 import streamlit as st
-import pandas as pd, requests, datetime, random, string, io, os, re, tempfile
+import pandas as pd, requests, datetime, random, string, io, os, re, tempfile, hmac
+from urllib.parse import quote_plus
 import docx
 from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -8,13 +9,22 @@ import seaborn as sns
 import scipy.stats as stats
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import streamlit.components.v1 as components
 import PyPDF2
 import numpy as np
 import pyreadstat
 import statsmodels.api as sm
 
-BUSINESS_NAME="Research Base HQ"; APP_NAME="Research Base HQ"; BUSINESS_EMAIL="support@researchbasehq.ng"; VERIFY_DOMAIN="researchbasehq.ng/verify"; ADMIN_PASSWORD="Researchbasehq2026!"
+st.set_page_config(page_title="Research Base HQ", layout="wide")
+
+# ---------------------------------------------------------------- SECRETS
+def _secret(name, default=None):
+    try: return st.secrets[name]
+    except Exception: return default
+
+ADMIN_PASSWORD = _secret("admin_password")          # set in secrets.toml — never hardcode
+TEST_MODE = bool(_secret("test_mode", False))        # true only in your LOCAL secrets
+
+BUSINESS_NAME="Research Base HQ"; APP_NAME="Research Base HQ"; BUSINESS_EMAIL="support@researchbasehq.ng"; VERIFY_DOMAIN="researchbasehq.ng/verify"
 WHATSAPP_NUMBER="2347054857303"
 WHATSAPP_DISPLAY="07054857303"
 WHATSAPP_LINK=f"https://wa.me/{WHATSAPP_NUMBER}?text=Hello%20ResearchHub%20Support,%20I%20need%20help%20with%20my%20project."
@@ -22,8 +32,9 @@ UNIVERSITIES=["University of Port Harcourt","University of Lagos","University of
 DEPARTMENTS=["Nursing","Medicine","Physiology","Anatomy","Pharmacy","Public Health","Medical Lab Science","Radiography","Biochemistry","Microbiology","Pharmacology","Other"]
 PRICE_TIERS = {"Basic - ₦30,000 (Analyse + Format)": {"amount": 3000000, "display": 30000}, "Standard - ₦40,000 (Most Popular + AI Checker)": {"amount": 4000000, "display": 40000}}
 
+# ---------------------------------------------------------------- CHAPTER 3 PARSING
 def extract_ch3(file):
-    text=""; 
+    text=""
     try:
         if file.name.endswith('.pdf'):
             reader=PyPDF2.PdfReader(file)
@@ -46,15 +57,18 @@ def parse_ch3(text):
     dv=re.search(r'dependent variable[^.]*?is\s+([a-z ]{3,40})',t)
     return {"methods":m,"dv_text":dv.group(1) if dv else ""}
 
+# ---------------------------------------------------------------- GOOGLE SHEETS
+@st.cache_resource(show_spinner=False)
+def _connect():
+    scope=["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
+    creds_dict=dict(st.secrets["gcp_service_account"])
+    creds=ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    client=gspread.authorize(creds)
+    return client.open_by_url(st.secrets["paysheets"]["sheet_url"])
+
 def get_sheet():
-    try:
-        scope=["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
-        creds_dict=dict(st.secrets["gcp_service_account"])
-        creds=ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        client=gspread.authorize(creds)
-        sh=client.open_by_url(st.secrets["paysheets"]["sheet_url"])
-        return sh
-    except: return None
+    try: return _connect()
+    except Exception: return None
 
 def save_payment(row):
     try:
@@ -70,41 +84,56 @@ def save_review(row):
     except: pass
     return False
 
-def check_code_valid(code):
-    try:
-        sh=get_sheet()
-        if not sh: return True, "Valid"
-        records=sh.worksheet("Payments").get_all_records()
-        for r in records:
-            if str(r.get("verify_code","")).strip() == code:
-                try:
-                    pay_date = datetime.datetime.strptime(str(r.get("date","")).split("")[0], "%Y-%m-%d")
-                    days = (datetime.datetime.now() - pay_date).days
-                    if days > 180: return False, f"Expired {days} days ago"
-                    else: return True, f"{180-days} days left"
-                except: return True, "Valid"
-        return False, "Not found"
-    except: return True, "Valid"
+# Payments sheet columns (row 1 must be a header row; data in this order — matches save_payment)
+COL = {"date":0,"uni":1,"dept":2,"title":3,"code":4,"email":5,"amount":6,"tier":7,"reg":8,"status":9,"ref":10}
 
-def check_existing_project_payment(reg_no, project_title):
-    try:
-        sh=get_sheet()
-        if not sh: return False, None
-        records=sh.worksheet("Payments").get_all_records()
-        for r in records:
-            if str(r.get("reg_no","")).strip().lower() == reg_no.strip().lower() and str(r.get("project_title","")).strip().lower() == project_title.strip().lower():
-                try:
-                    pay_date = datetime.datetime.strptime(str(r.get("date","")).split("")[0], "%Y-%m-%d")
-                    if (datetime.datetime.now() - pay_date).days <= 180: return True, r.get("verify_code","")
-                except: return True, r.get("verify_code","")
-        return False, None
-    except: return False, None
+def _cell(r, key):
+    i = COL[key]
+    return str(r[i]).strip() if len(r) > i else ""
 
-def initialize_paystack(email, amount_kobo):
+def _parse_date(s):
+    s = str(s).strip().split(" ")[0]
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
+        try: return datetime.datetime.strptime(s, fmt)
+        except ValueError: continue
+    return None
+
+@st.cache_data(ttl=45, show_spinner=False)
+def payment_rows():
+    sh = get_sheet()
+    if not sh: return None
+    try: return sh.worksheet("Payments").get_all_values()[1:]   # skip header row
+    except Exception: return None
+
+def reference_used(ref):
+    return any(_cell(r, "ref") == ref for r in (payment_rows() or []))
+
+def find_payment(reg_no, title, email, code=None):
+    """Fail-closed: access is restored only if reg no + title + email (+ code) match a successful, unexpired payment."""
+    rows = payment_rows()
+    if not rows: return None
+    for r in reversed(rows):
+        if _cell(r, "status") != "success": continue
+        if _cell(r, "reg").lower() != reg_no.strip().lower(): continue
+        if _cell(r, "title").lower() != title.strip().lower(): continue
+        if _cell(r, "email").lower() != email.strip().lower(): continue
+        if code and _cell(r, "code") != code: continue
+        d = _parse_date(_cell(r, "date"))
+        if d is None or (datetime.datetime.now() - d).days > 180: continue
+        return {"code": _cell(r, "code"), "tier": _cell(r, "tier")}
+    return None
+
+# ---------------------------------------------------------------- PAYSTACK
+def _app_url():
+    try: return st.secrets["app"]["url"]
+    except Exception: return None
+
+def initialize_paystack(email, amount_kobo, metadata=None):
     try:
         secret=st.secrets["paystack"]["secret_key"]
         headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"}
-        data={"email": email, "amount": amount_kobo, "currency": "NGN"}
+        data={"email": email, "amount": amount_kobo, "currency": "NGN", "metadata": metadata or {}}
+        if _app_url(): data["callback_url"] = _app_url()
         r=requests.post("https://api.paystack.co/transaction/initialize", headers=headers, json=data, timeout=20)
         res=r.json()
         if res.get("status"): return res["data"]["authorization_url"], res["data"]["reference"]
@@ -118,6 +147,7 @@ def verify_paystack(reference):
         data=r.json(); return data.get("data",{}).get("status")=="success", data.get("data",{})
     except: return False, {}
 
+# ---------------------------------------------------------------- ANALYSIS
 def spss_descriptive_table(df):
     rows=[]
     for col in df.columns:
@@ -232,7 +262,7 @@ def spss_graphs(df, dv, ivs, group_col=None):
         except: pass
     return figs
 
-st.set_page_config(page_title=APP_NAME, layout="wide")
+# ---------------------------------------------------------------- STYLES
 st.markdown(f"""
 <style>
 .hero {{background: linear-gradient(135deg, #0A1931 0%, #185ADB 100%); padding: 45px 25px; border-radius: 16px; color: white; text-align: center; margin-bottom: 20px;}}
@@ -250,12 +280,12 @@ st.markdown(f"""
 for k,v in {"is_admin":False,"show_admin_login":False,"paid":False,"verify_code":None,"tier":None,"last_project_paid":""}.items():
     if k not in st.session_state: st.session_state[k]=v
 
-query_params=st.query_params
-if query_params.get("admin",["0"])[0]=="1" and not st.session_state.is_admin: st.session_state.show_admin_login=True
+# ---------------------------------------------------------------- ADMIN
+if st.query_params.get("admin")=="1" and not st.session_state.is_admin: st.session_state.show_admin_login=True
 if st.session_state.show_admin_login and not st.session_state.is_admin:
     st.markdown("### 🔒 Creator Only"); pwd=st.text_input("Creator Password",type="password")
     if st.button("Login as Creator"):
-        if pwd==ADMIN_PASSWORD: st.session_state.is_admin=True; st.session_state.show_admin_login=False; st.rerun()
+        if ADMIN_PASSWORD and hmac.compare_digest(pwd, str(ADMIN_PASSWORD)): st.session_state.is_admin=True; st.session_state.show_admin_login=False; st.rerun()
         else: st.error("Denied"); st.stop()
 
 if st.session_state.is_admin:
@@ -267,6 +297,44 @@ if st.session_state.is_admin:
     if st.button("Logout Creator"): st.session_state.is_admin=False; st.query_params.clear(); st.rerun()
     st.stop()
 
+# ---------------------------------------------------------------- RETURN FROM PAYSTACK (runs before the input widgets)
+def _restore_choice(key, other_key, options, value):
+    if not value: return
+    if value in options: st.session_state[key] = value
+    else: st.session_state[key] = "Other"; st.session_state[other_key] = value
+
+pay_ref = st.query_params.get("reference") or st.query_params.get("trxref")
+if pay_ref:
+    ok, pdata = verify_paystack(pay_ref)
+    meta = pdata.get("metadata") or {}
+    if not isinstance(meta, dict): meta = {}
+    tier = meta.get("tier", "")
+    expected = PRICE_TIERS.get(tier, {}).get("amount")
+    if ok and expected and pdata.get("amount") == expected and pdata.get("currency", "NGN") == "NGN":
+        pay_email = (pdata.get("customer") or {}).get("email", "")
+        reg = str(meta.get("reg_no", "")).strip(); title = str(meta.get("project_title", "")).strip()
+        if not reference_used(pay_ref):
+            vc = ''.join(random.choices(string.ascii_uppercase+string.digits, k=8))
+            saved = save_payment([datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), meta.get("uni",""), meta.get("dept",""), title, vc, pay_email, str(pdata.get("amount",0)), tier, reg, "success", pay_ref])
+            payment_rows.clear()
+            if not saved:
+                # payment is genuine but the sheet failed: grant this session, tell them to keep the reference
+                st.session_state.paid=True; st.session_state.verify_code=vc; st.session_state.tier=tier
+                st.session_state.last_project_paid=f"{reg.lower()}|{title.lower()}"
+                st.session_state["pay_notice"]=f"Payment received but not recorded. Save this reference and send it on WhatsApp: {pay_ref}"
+        _restore_choice("uni_sel", "uni_other", UNIVERSITIES, meta.get("uni",""))
+        _restore_choice("dept_sel", "dept_other", DEPARTMENTS, meta.get("dept",""))
+        st.session_state["reg_no_in"]=reg; st.session_state["project_title_in"]=title
+        st.session_state["student_email_in"]=pay_email; st.session_state["student_name_in"]=str(meta.get("student_name",""))
+        st.session_state["just_paid"]=True
+    else:
+        st.session_state["pay_notice"]=f"Payment verification failed. If you were debited, send this reference on WhatsApp: {pay_ref}"
+    st.query_params.clear(); st.rerun()
+
+if "pay_notice" in st.session_state: st.warning(st.session_state.pop("pay_notice"))
+if st.session_state.pop("just_paid", False): st.balloons()
+
+# ---------------------------------------------------------------- HEADER
 st.markdown(f"<div style='text-align:center;'><span class='app-name'>📘 {APP_NAME}</span></div>", unsafe_allow_html=True)
 
 if not st.session_state.paid:
@@ -283,56 +351,48 @@ if not st.session_state.paid:
 </div>
 """, unsafe_allow_html=True)
 
+# ---------------------------------------------------------------- PROJECT DETAILS
 st.divider()
 st.subheader("Start Here — Your University & Project")
 c1,c2=st.columns(2)
 with c1:
-    uni=st.selectbox("Select Your University *", UNIVERSITIES)
-    if uni=="Other": uni=st.text_input("Enter Your University Name *")
-    reg_no=st.text_input("Registration Number / Research ID *")
-    student_name=st.text_input("Full Name")
+    uni=st.selectbox("Select Your University *", UNIVERSITIES, key="uni_sel")
+    if uni=="Other": uni=st.text_input("Enter Your University Name *", key="uni_other")
+    reg_no=st.text_input("Registration Number / Research ID *", key="reg_no_in")
+    student_name=st.text_input("Full Name", key="student_name_in")
 with c2:
-    dept=st.selectbox("Select Department", DEPARTMENTS)
-    if dept=="Other": dept=st.text_input("Enter Department")
-    project_title=st.text_input("Research / Project Title * (Access tied to this title)")
-    student_email=st.text_input("Email *")
+    dept=st.selectbox("Select Department", DEPARTMENTS, key="dept_sel")
+    if dept=="Other": dept=st.text_input("Enter Department", key="dept_other")
+    project_title=st.text_input("Research / Project Title * (Access tied to this title)", key="project_title_in")
+    student_email=st.text_input("Email *", key="student_email_in")
+
+def start_checkout(tier_choice):
+    meta = {"reg_no": reg_no.strip(), "project_title": project_title.strip(), "tier": tier_choice,
+            "uni": uni, "dept": dept, "student_name": student_name}
+    url, _ = initialize_paystack(student_email.strip(), PRICE_TIERS[tier_choice]["amount"], meta)
+    if url: st.link_button("Pay on Paystack (Secure) →", url, type="primary", use_container_width=True)
+
+def grant(hit, key):
+    st.session_state.paid=True; st.session_state.verify_code=hit["code"]
+    st.session_state.tier=hit["tier"]; st.session_state.last_project_paid=key
 
 current_project_key = f"{reg_no.strip().lower()}|{project_title.strip().lower()}"
-if st.session_state.last_project_paid != "" and st.session_state.last_project_paid != current_project_key and st.session_state.paid:
-    st.warning(f"🔒 New project detected! Pay for this new topic"); st.session_state.paid=False; st.session_state.verify_code=None
+if st.session_state.paid and st.session_state.last_project_paid != current_project_key:
+    st.warning("🔒 New project detected! Pay for this new topic")
+    st.session_state.paid=False; st.session_state.verify_code=None; st.session_state.tier=None
 
-if not st.session_state.paid and reg_no and project_title and len(project_title.strip())>5:
-    already_paid, existing_code = check_existing_project_payment(reg_no, project_title)
-    if already_paid:
-        st.session_state.paid=True; st.session_state.verify_code=existing_code; st.session_state.last_project_paid=current_project_key
-        st.success(f"✅ Existing payment found — Access restored")
+if not st.session_state.paid and reg_no and project_title and len(project_title.strip())>5 and "@" in student_email:
+    hit = find_payment(reg_no, project_title, student_email)
+    if hit:
+        grant(hit, current_project_key); st.success("✅ Existing payment found — Access restored")
 
 if not st.session_state.paid:
     with st.expander("🔑 Already paid for THIS exact project? Restore code"):
         code_in=st.text_input("Enter verification code")
         if code_in:
-            ok,msg=check_code_valid(code_in.strip().upper())
-            if ok:
-                sh=get_sheet(); valid_proj=False
-                if sh:
-                    try:
-                        records=sh.worksheet("Payments").get_all_records()
-                        for r in records:
-                            if str(r.get("verify_code","")).strip() == code_in.strip().upper():
-                                if str(r.get("project_title","")).strip().lower() == project_title.strip().lower() and str(r.get("reg_no","")).strip().lower() == reg_no.strip().lower():
-                                    valid_proj=True; break
-                    except: valid_proj=True
-                if valid_proj: st.session_state.paid=True; st.session_state.verify_code=code_in.strip().upper(); st.session_state.last_project_paid=current_project_key; st.rerun()
-                else: st.error("Code for different project topic — Pay again")
-            else: st.error(msg)
-    ref=query_params.get("reference",[None])[0] or query_params.get("trxref",[None])[0]
-    if ref:
-        ok,data=verify_paystack(ref)
-        if ok:
-            vc=''.join(random.choices(string.ascii_uppercase+string.digits, k=8)); tier=st.session_state.get("selected_tier","Basic")
-            save_payment([datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), uni, dept, project_title, vc, student_email, str(data.get("amount",0)), tier, reg_no, "success", ref])
-            st.session_state.paid=True; st.session_state.verify_code=vc; st.session_state.tier=tier; st.session_state.last_project_paid=current_project_key; st.balloons(); st.query_params.clear(); st.rerun()
-        else: st.error("Payment verification failed — If debited, use WhatsApp button")
+            hit = find_payment(reg_no, project_title, student_email, code=code_in.strip().upper())
+            if hit: grant(hit, current_project_key); st.rerun()
+            else: st.error("Code not found for this Reg No, Project Title and Email — or it has expired. Fill all three fields above exactly as you used when paying.")
 
 if not st.session_state.paid:
     st.divider()
@@ -386,18 +446,20 @@ if not st.session_state.paid:
     tier_choice=st.radio("Select Plan", list(PRICE_TIERS.keys()), index=1); st.session_state.selected_tier=tier_choice
     if student_email and reg_no and project_title and "@" in student_email:
         if st.button(f"💳 Pay ₦{PRICE_TIERS[tier_choice]['display']:,} for this project", type="primary", use_container_width=True):
-            url, ref = initialize_paystack(student_email, PRICE_TIERS[tier_choice]['amount'])
-            if url: st.link_button("Pay on Paystack (Secure)", url); components.html(f'<script>window.open("{url}", "_self")</script>', height=0)
+            start_checkout(tier_choice)
     else: st.warning("Enter Reg No + Project Title + Email to pay")
-    if st.button("Test Unlock (Creator)"):
-        vc=''.join(random.choices(string.ascii_uppercase+string.digits, k=8)); save_payment([datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), uni, dept, project_title, vc, student_email, PRICE_TIERS[tier_choice]['display'], tier_choice, reg_no, "test", "test"]); st.session_state.paid=True; st.session_state.verify_code=vc; st.session_state.tier=tier_choice; st.session_state.last_project_paid=current_project_key; st.rerun()
+    if TEST_MODE and st.button("Test Unlock (dev only)"):
+        vc=''.join(random.choices(string.ascii_uppercase+string.digits, k=8))
+        st.session_state.paid=True; st.session_state.verify_code=vc; st.session_state.tier=tier_choice
+        st.session_state.last_project_paid=current_project_key; st.rerun()
 
 if st.session_state.paid:
     st.success(f"✅ Active for: '{project_title}' — {VERIFY_DOMAIN}/{st.session_state.verify_code} — No watermark — Correct Order")
 
 tab1,tab2,tab3,tab4,tab5,tab6=st.tabs(["1️⃣ Upload (FREE)","2️⃣ Analysis","3️⃣ Discuss with PubMed/Scholar","4️⃣ Format — Choose Uni Format","5️⃣ Send to Admin","6️⃣ AI Checker — Standard"])
 
-with tab1:
+# ---------------------------------------------------------------- TAB 1
+def render_upload_tab():
     st.header("Upload Data — Specific Format Required — Prevents Analyst Trip")
     study_type = st.radio("What is your study? *", ["Human / Survey (Nursing, Public Health, etc.)", "Rat / Experimental (Physiology, Anatomy, Biochemistry, Pharmacology)"], horizontal=True)
     tmpl_buf = io.BytesIO()
@@ -420,35 +482,39 @@ with tab1:
         try:
             xls=pd.ExcelFile(up)
             if 'Data' not in xls.sheet_names or 'Variable_Map' not in xls.sheet_names:
-                st.error("❌ Wrong format! Must have 2 sheets: 'Data' and 'Variable_Map'. Download template above."); st.stop()
+                st.error("❌ Wrong format! Must have 2 sheets: 'Data' and 'Variable_Map'. Download template above."); return
             df=pd.read_excel(xls, sheet_name='Data')
             vmap_df=pd.read_excel(xls, sheet_name='Variable_Map')
             if 'Variable_Name' not in vmap_df.columns or 'Role' not in vmap_df.columns:
-                st.error("❌ Variable_Map must have Variable_Name, Role, Type"); st.stop()
-            dv_rows=vmap_df[vmap_df['Role'].str.lower()=='dependent']
-            if len(dv_rows)==0: st.error("❌ Mark 1 variable as Role = Dependent"); st.stop()
-            if len(dv_rows)>1: 
+                st.error("❌ Variable_Map must have Variable_Name, Role, Type"); return
+            dv_rows=vmap_df[vmap_df['Role'].astype(str).str.lower()=='dependent']
+            if len(dv_rows)==0: st.error("❌ Mark 1 variable as Role = Dependent"); return
+            if len(dv_rows)>1:
                 st.warning(f"Multiple Dependent found: {', '.join(dv_rows['Variable_Name'])} — Using first as primary DV: {dv_rows.iloc[0]['Variable_Name']}")
             st.success(f"✅ Correct! {df.shape[0]} rows | Map: {len(vmap_df)} vars | Study: {study_type}")
             st.dataframe(df.head()); st.write("Your Variable Map:"); st.dataframe(vmap_df, use_container_width=True)
             st.session_state.df=df; st.session_state.vmap=vmap_df
             st.session_state.auto_dv=dv_rows.iloc[0]['Variable_Name']
-            st.session_state.auto_ivs=vmap_df[vmap_df['Role'].str.lower()=='independent']['Variable_Name'].tolist()
-            st.session_state.categorical_vars=vmap_df[vmap_df['Role'].str.lower().isin(['categorical','nominal','control'])]['Variable_Name'].tolist()
-            grp_rows=vmap_df[vmap_df['Role'].str.lower()=='group']
+            st.session_state.auto_ivs=vmap_df[vmap_df['Role'].astype(str).str.lower()=='independent']['Variable_Name'].tolist()
+            st.session_state.categorical_vars=vmap_df[vmap_df['Role'].astype(str).str.lower().isin(['categorical','nominal','control'])]['Variable_Name'].tolist()
+            grp_rows=vmap_df[vmap_df['Role'].astype(str).str.lower()=='group']
             if not grp_rows.empty: st.session_state.group_col=grp_rows.iloc[0]['Variable_Name']
-            else: 
+            else:
                 gc=None
                 for c in df.columns:
                     if 'group' in c.lower() and 2<=df[c].nunique()<=8:
                         gc=c; break
                 st.session_state.group_col=gc
-        except Exception as e: st.error(f"Error: {e}"); st.stop()
+        except Exception as e: st.error(f"Error: {e}"); return
         if ch3_up:
             ch3_text=extract_ch3(ch3_up); ch3_info=parse_ch3(ch3_text); st.session_state.ch3_info=ch3_info
             st.success(f"📘 Methods: {', '.join(ch3_info['methods'])}")
     else: st.warning("Upload template — Descriptive → ANOVA → Tukey order — No analyst needed")
 
+with tab1:
+    render_upload_tab()
+
+# ---------------------------------------------------------------- TAB 2
 with tab2:
     st.header(f"📊 Analysis in Correct Order — For: {project_title}")
     if 'df' not in st.session_state: st.warning("Upload data in Tab 1")
@@ -461,7 +527,7 @@ with tab2:
         st.caption("Correct Chapter 4 Order: 1️⃣ Descriptive → 2️⃣ Descriptive by Group (rats) → 3️⃣ Frequency → 4️⃣ ANOVA/T-Test/Regression → 5️⃣ Tukey Post-Hoc")
         c1,c2,c3=st.columns(3)
         with c1: dep_col=st.selectbox("Dependent (DV) — 1 only", df.columns, index=list(df.columns).index(dep_col) if dep_col in df.columns else 0)
-        with c2: indep_cols=st.multiselect("Independent (IVs)", [c for c in df.columns if c!=dep_col], default=indep_cols)
+        with c2: indep_cols=st.multiselect("Independent (IVs)", [c for c in df.columns if c!=dep_col], default=[c for c in indep_cols if c in df.columns and c!=dep_col])
         with c3: group_col_sel=st.selectbox("Group Column (for rats, else None)", ["None"]+list(df.columns), index=(["None"]+list(df.columns)).index(group_col) if group_col in df.columns else 0)
         group_col = None if group_col_sel=="None" else group_col_sel
         if not st.session_state.paid:
@@ -469,13 +535,16 @@ with tab2:
             if not full_table.empty:
                 st.subheader("1️⃣ Descriptive — FREE TEASER (1 row)")
                 st.dataframe(full_table.head(1), use_container_width=True)
-                st.markdown(f"<div class='locked-box'>🔒 Full Table Locked — Pay for this project to unlock full descriptive → group → ANOVA → Tukey in correct order</div>", unsafe_allow_html=True)
-                st.markdown("<div class='blur'>"); st.dataframe(full_table, use_container_width=True); st.markdown("</div>")
+                st.markdown("<div class='locked-box'>🔒 Full Table Locked — Pay for this project to unlock full descriptive → group → ANOVA → Tukey in correct order</div>", unsafe_allow_html=True)
+                if len(full_table) > 1:
+                    masked = full_table.iloc[1:].astype(object).copy()
+                    for mc in masked.columns[1:]: masked[mc] = "🔒"
+                    st.dataframe(masked, use_container_width=True)
                 if student_email and reg_no and project_title and "@" in student_email:
                     tier_choice=st.session_state.get("selected_tier","Basic - ₦30,000 (Analyse + Format)")
                     if st.button(f"💳 Unlock — Pay ₦{PRICE_TIERS[tier_choice]['display']:,}", type="primary", use_container_width=True):
-                        url, ref = initialize_paystack(student_email, PRICE_TIERS[tier_choice]['amount'])
-                        if url: st.link_button("Pay on Paystack", url); components.html(f'<script>window.open("{url}", "_self")</script>', height=0)
+                        start_checkout(tier_choice)
+                else: st.caption("Fill Reg No, Project Title and Email at the top of the page to unlock.")
         else:
             st.success(f"✅ FULL ACCESS — Correct Order: Descriptive → ANOVA → Tukey — No watermark")
             st.divider(); st.subheader("1️⃣ Descriptive Statistics — Chapter 4.1 — SPSS Style")
@@ -489,6 +558,8 @@ with tab2:
                         desc_by_group.columns=['N','Mean','SD','Min','Max']; st.dataframe(desc_by_group, use_container_width=True)
                         st.session_state.desc_by_group=desc_by_group
                 except Exception as e: st.error(f"Group descriptive error: {e}")
+            else:
+                st.session_state.pop('desc_by_group', None)
             st.subheader("3️⃣ Frequency Table — Chapter 4.1c")
             col_f=st.selectbox("Frequency Table", df.columns, key="freq")
             freq=df[col_f].value_counts().reset_index(); freq.columns=[col_f,"Frequency"]; freq["Percent"]=(freq["Frequency"]/len(df)*100).round(1); freq["Cumulative %"]=freq["Percent"].cumsum().round(1)
@@ -556,14 +627,15 @@ with tab2:
                 buf=io.BytesIO(); fig.savefig(buf,format='png',dpi=300,bbox_inches='tight'); buf.seek(0)
                 st.download_button(f"🖼️ {name}.png — No Watermark", data=buf, file_name=f"{name}.png", mime="image/png", key=f"dl_{name}")
 
+# ---------------------------------------------------------------- TAB 3
 with tab3:
     if not st.session_state.paid:
         st.markdown("<div class='locked-box'><h3>🔒 Discuss Locked — Pay to unlock teaching with Consensus, Jenni, PubMed, Google Scholar</h3></div>", unsafe_allow_html=True)
     else:
         st.header(f"💬 Discuss — Learn to Discuss Using Similar Articles — Consensus + Jenni + PubMed + Google Scholar — {project_title}")
         st.info("We teach you to discuss — using real similar articles online as guideline — not AI hallucination — supervisor wants real citations")
-        dep_col = st.session_state.get('auto_dv','Variable')
-        group_col = st.session_state.get('group_col','Group')
+        dep_col = st.session_state.get('auto_dv') or 'Variable'
+        group_col = st.session_state.get('group_col') or 'Group'
         base_query = f"{project_title} {dep_col} {group_col}".strip()
         anova_query = f"{dep_col} effect of {group_col} dose response"
         scholar_query = f"{dep_col} {group_col} experimental study"
@@ -571,8 +643,8 @@ with tab3:
         st.caption("Click to open with YOUR project keywords — find 2-3 similar articles to use as guideline — copy Title + Year")
         r1c1,r1c2,r1c3 = st.columns(3)
         with r1c1:
-            consensus_url = f"https://consensus.app/search/?q={base_query.replace('','%20')}&searchMode=chat"
-            consensus_url2 = f"https://consensus.app/search/?q={anova_query.replace('','%20')}"
+            consensus_url = f"https://consensus.app/search/?q={quote_plus(base_query)}&searchMode=chat"
+            consensus_url2 = f"https://consensus.app/search/?q={quote_plus(anova_query)}"
             st.markdown(f"""
 <div style="border:2px solid #185ADB; border-radius:12px; padding:12px; background:#F0F7FF; height:190px;">
 <b>🔬 1. Consensus.ai — Yes/No evidence</b><br>
@@ -582,8 +654,8 @@ with tab3:
 </div>
 """, unsafe_allow_html=True)
         with r1c2:
-            pubmed_url = f"https://pubmed.ncbi.nlm.nih.gov/?term={base_query.replace('','+')}&sort=date"
-            pubmed_url2 = f"https://pubmed.ncbi.nlm.nih.gov/?term={dep_col.replace('','+')}+{group_col.replace('','+')}"
+            pubmed_url = f"https://pubmed.ncbi.nlm.nih.gov/?term={quote_plus(base_query)}&sort=date"
+            pubmed_url2 = f"https://pubmed.ncbi.nlm.nih.gov/?term={quote_plus(str(dep_col) + ' ' + str(group_col))}"
             st.markdown(f"""
 <div style="border:2px solid #0F766E; border-radius:12px; padding:12px; background:#F0FDFA; height:190px;">
 <b>🧬 2. PubMed — Biomedical — Free full text</b><br>
@@ -593,8 +665,8 @@ with tab3:
 </div>
 """, unsafe_allow_html=True)
         with r1c3:
-            scholar_url = f"https://scholar.google.com/scholar?q={scholar_query.replace('','+')}&as_ylo=2018"
-            scholar_url2 = f"https://scholar.google.com/scholar?q={base_query.replace('','+')}"
+            scholar_url = f"https://scholar.google.com/scholar?q={quote_plus(scholar_query)}&as_ylo=2018"
+            scholar_url2 = f"https://scholar.google.com/scholar?q={quote_plus(base_query)}"
             st.markdown(f"""
 <div style="border:2px solid #1E40AF; border-radius:12px; padding:12px; background:#EFF6FF; height:190px;">
 <b>📚 3. Google Scholar — Most cited — All fields</b><br>
@@ -606,7 +678,7 @@ with tab3:
         r2c1,r2c2,r2c3 = st.columns(3)
         with r2c1:
             jenni_url = "https://app.jenni.ai"
-            semantic_url = f"https://www.semanticscholar.org/search?q={base_query.replace('','%20')}&sort=relevance"
+            semantic_url = f"https://www.semanticscholar.org/search?q={quote_plus(base_query)}&sort=relevance"
             st.markdown(f"""
 <div style="border:2px solid #7C3AED; border-radius:12px; padding:12px; background:#F5F0FF; height:190px;">
 <b>✍️ 4. Jenni.ai — Write with citations</b><br>
@@ -663,7 +735,7 @@ with tab3:
             try:
                 if 'df' in st.session_state:
                     ch3 = st.session_state.get('ch3_info',{"methods":["ANOVA","Tukey"]})
-                    infer_temp = run_inferential_correct_order(st.session_state.df, dep_col, st.session_state.get('auto_ivs',[]), group_col, ch3['methods'])
+                    infer_temp = run_inferential_correct_order(st.session_state.df, dep_col, st.session_state.get('auto_ivs',[]), st.session_state.get('group_col'), ch3['methods'])
                     if 'ANOVA' in infer_temp:
                         anova_line = f"One-way ANOVA showed significant difference in {dep_col} across {infer_temp['ANOVA']['factor']} (F={infer_temp['ANOVA']['F']}, p={infer_temp['ANOVA']['Sig.']}). Tukey HSD identified specific group differences."
             except: pass
@@ -694,14 +766,17 @@ Objective achieved. Descriptive by group, ANOVA, Tukey confirm {dep_col} varies 
 References for discussion (from your similar articles — format in Tab 4 with 10+ styles):
 {refs_guideline}
 """
-            st.text_area("Edit final discussion — Keep citations intact — Will be preserved in Tab 4 with 10+ styles", value=draft, height=450, key="discussion_guideline_full")
-            doc = docx.Document()
-            style = doc.styles['Normal']; style.font.name="Times New Roman"; style.font.size=Pt(12); style.paragraph_format.line_spacing=Pt(18)
-            for para_text in draft.split("\n\n"):
+            st.session_state["discussion_guideline_full"] = draft   # set BEFORE the text_area below is created
+
+        if "discussion_guideline_full" in st.session_state:
+            st.text_area("Edit final discussion — Keep citations intact — Will be preserved in Tab 4 with 10+ styles", height=450, key="discussion_guideline_full")
+            ddoc = docx.Document()
+            dstyle = ddoc.styles['Normal']; dstyle.font.name="Times New Roman"; dstyle.font.size=Pt(12); dstyle.paragraph_format.line_spacing=Pt(18)
+            for para_text in st.session_state["discussion_guideline_full"].split("\n\n"):
                 if para_text.strip():
-                    doc.add_paragraph(para_text.strip())
-            bio = io.BytesIO(); doc.save(bio)
-            st.download_button("📄 Download Discussion — With PubMed + Scholar + Consensus Guideline — No Watermark — Citations Intact", bio.getvalue(), f"{reg_no}_Discussion_PubMed_Scholar_Consensus_Jenni.docx", use_container_width=True)
+                    ddoc.add_paragraph(para_text.strip())
+            dbio = io.BytesIO(); ddoc.save(dbio)
+            st.download_button("📄 Download Discussion — With PubMed + Scholar + Consensus Guideline — No Watermark — Citations Intact", dbio.getvalue(), f"{reg_no}_Discussion_PubMed_Scholar_Consensus_Jenni.docx", use_container_width=True)
             st.success("Discussion uses YOUR similar articles from PubMed/Google Scholar/Consensus as guideline — not fake — ready for Tab 4 formatting into APA 7th/Vancouver etc.")
         st.divider()
         st.markdown(f"""
@@ -711,6 +786,7 @@ References for discussion (from your similar articles — format in Tab 4 with 1
 </div>
 """, unsafe_allow_html=True)
 
+# ---------------------------------------------------------------- TAB 4
 with tab4:
     if not st.session_state.paid:
         st.markdown("<div class='locked-box'><h3>🔒 Format Locked — Pay to unlock university format chooser</h3></div>", unsafe_allow_html=True)
@@ -718,14 +794,14 @@ with tab4:
         st.header(f"📄 Format Chapters 1-5 — Choose/Confirm Your University Format On The Spot — References + 10+ Styles — No Watermark")
 
         uni_formats = {
-"University of Port Harcourt": {"font":"Times New Roman","size":12,"spacing":1.5,"margin":"1 inch all sides","chapter":"CHAPTER ONE","ref":"APA 7th"},
-"University of Lagos": {"font":"Times New Roman","size":12,"spacing":2.0,"margin":"1 inch","chapter":"CHAPTER ONE","ref":"APA 6th"},
-"University of Ibadan": {"font":"Times New Roman","size":12,"spacing":2.0,"margin":"1.5 left, 1 others","ref":"APA 7th"},
-"University of Benin": {"font":"Times New Roman","size":12,"spacing":1.5,"ref":"APA 7th"},
-"University of Nigeria Nsukka": {"font":"Times New Roman","size":12,"spacing":2.0,"ref":"APA 7th"},
-"Rivers State University": {"font":"Times New Roman","size":12,"spacing":1.5,"ref":"APA 7th"},
-"Ignatius Ajuru University": {"font":"Times New Roman","size":12,"spacing":2.0,"ref":"APA 6th"},
-"Other / Custom": {"font":"Times New Roman","size":12,"spacing":1.5,"ref":"APA 7th"}
+            "University of Port Harcourt": {"font":"Times New Roman","size":12,"spacing":1.5,"margin":"1 inch all sides","chapter":"CHAPTER ONE","ref":"APA 7th"},
+            "University of Lagos": {"font":"Times New Roman","size":12,"spacing":2.0,"margin":"1 inch","chapter":"CHAPTER ONE","ref":"APA 6th"},
+            "University of Ibadan": {"font":"Times New Roman","size":12,"spacing":2.0,"margin":"1.5 left, 1 others","ref":"APA 7th"},
+            "University of Benin": {"font":"Times New Roman","size":12,"spacing":1.5,"ref":"APA 7th"},
+            "University of Nigeria Nsukka": {"font":"Times New Roman","size":12,"spacing":2.0,"ref":"APA 7th"},
+            "Rivers State University": {"font":"Times New Roman","size":12,"spacing":1.5,"ref":"APA 7th"},
+            "Ignatius Ajuru University": {"font":"Times New Roman","size":12,"spacing":2.0,"ref":"APA 6th"},
+            "Other / Custom": {"font":"Times New Roman","size":12,"spacing":1.5,"ref":"APA 7th"}
         }
         st.subheader("🏛️ Step 1 — Choose/Confirm Your University Format On The Spot")
         selected_uni_format = st.selectbox("Select Your University to Auto-Load Official Format *", list(uni_formats.keys()), index=list(uni_formats.keys()).index(uni) if uni in uni_formats else 0)
@@ -734,15 +810,15 @@ with tab4:
         confirm_format = st.checkbox(f"Confirm — Use {selected_uni_format} official format — I have checked with my department", value=True)
 
         c0,c1,c2=st.columns(3)
-        with c0: 
+        with c0:
             font_options=["Times New Roman","Arial","Calibri","Cambria","Garamond"]
             font_idx = font_options.index(fmt['font']) if fmt['font'] in font_options else 0
             font_choice=st.selectbox("Font *", font_options, index=font_idx)
-        with c1: 
+        with c1:
             size_options=[10,11,12,13,14]
             size_idx = size_options.index(fmt['size']) if fmt['size'] in size_options else 2
             size_choice=st.selectbox("Font Size *", size_options, index=size_idx)
-        with c2: 
+        with c2:
             spacing_options=[1.0,1.15,1.5,2.0]
             spacing_idx = spacing_options.index(fmt['spacing']) if fmt['spacing'] in spacing_options else 2
             spacing_choice=st.selectbox("Line Spacing *", spacing_options, index=spacing_idx)
@@ -756,69 +832,93 @@ with tab4:
             keep_cite=st.checkbox("Keep in-text citations intact — (Ade et al., 2020), [1] — Do not break", value=True)
             auto_sort=st.checkbox("Auto-sort References A-Z (for APA/Harvard)", value=False)
 
-        full=st.text_area("Paste Chapters 1-5 — From INTRODUCTION to REFERENCES — Citations will be kept intact", height=260, 
+        full=st.text_area("Paste Chapters 1-5 — From INTRODUCTION to REFERENCES — Citations will be kept intact", height=260,
             placeholder="Example:\nCHAPTER ONE...\nAs shown by Ade et al. (2020) and [1]...\n\nREFERENCES\nAde, J. (2020). Title. Journal...\nBola, S. (2021). Title...")
         if st.button("Format Full Project — University Format + Citations & References Intact — No Watermark", type="primary", use_container_width=True):
             if not confirm_format:
-                st.warning("Please confirm university format — Check box above")
-            doc=docx.Document()
-            style=doc.styles['Normal']; style.font.name=font_choice; style.font.size=Pt(size_choice); style.paragraph_format.line_spacing=spacing_choice; style.paragraph_format.space_after=Pt(6)
-            p=doc.add_paragraph(); p.alignment=WD_ALIGN_PARAGRAPH.CENTER
-            run=p.add_run(f"{project_title.upper()}\n\nBY\n\n{student_name.upper()}\n{reg_no}\n{dept.upper()}\n{selected_uni_format.upper()}"); run.bold=True; run.font.size=Pt(size_choice+2)
-            doc.add_page_break()
-            text_parts = re.split(r'\n\s*REFERENCES\s*\n|\n\s*REFERENCE\s*\n|\n\s*BIBLIOGRAPHY\s*\n', full, flags=re.IGNORECASE)
-            main_body = text_parts[0] if text_parts else full
-            ref_section = text_parts[1] if len(text_parts)>1 else ""
-            for para_text in main_body.split("\n\n"):
-                para_text=para_text.strip()
-                if not para_text: continue
-                para=doc.add_paragraph()
-                para.add_run(para_text)
-                para.paragraph_format.line_spacing=spacing_choice
-            if ref_section.strip():
-                doc.add_page_break()
-                h=doc.add_paragraph(); r=h.add_run("REFERENCES"); r.bold=True; r.font.size=Pt(size_choice+1); h.alignment=WD_ALIGN_PARAGRAPH.CENTER
-                refs = [r.strip() for r in ref_section.split("\n") if r.strip()]
-                if auto_sort and ref_style in ["APA 7th","APA 6th","Harvard","MLA 9th"]:
-                    refs = sorted(refs, key=lambda x: x.lower())
-                for ref_line in refs:
-                    p=doc.add_paragraph()
-                    p.add_run(ref_line)
-                    if ref_style in ["APA 7th","APA 6th","Harvard"]:
-                        p.paragraph_format.left_indent=Pt(36); p.paragraph_format.first_line_indent=Pt(-36)
-                        p.paragraph_format.line_spacing=2.0; p.paragraph_format.space_after=Pt(0)
-                    elif ref_style in ["MLA 9th","Chicago 17th","Turabian"]:
-                        p.paragraph_format.left_indent=Pt(36); p.paragraph_format.first_line_indent=Pt(-36)
-                        p.paragraph_format.line_spacing=2.0
-                    elif ref_style in ["Vancouver","IEEE","AMA 11th"]:
-                        p.paragraph_format.left_indent=Pt(18); p.paragraph_format.first_line_indent=Pt(0)
-                        p.paragraph_format.line_spacing=1.0; p.paragraph_format.space_after=Pt(3)
-                    elif ref_style == "OSCOLA":
-                        p.paragraph_format.left_indent=Pt(0); p.paragraph_format.first_line_indent=Pt(0)
-                        p.paragraph_format.line_spacing=1.0
-                    else:
-                        p.paragraph_format.line_spacing=spacing_choice
+                st.warning("Please confirm university format — tick the box above")
+            elif not full.strip():
+                st.warning("Paste your chapters first")
             else:
+                doc=docx.Document()
+                style=doc.styles['Normal']; style.font.name=font_choice; style.font.size=Pt(size_choice); style.paragraph_format.line_spacing=spacing_choice; style.paragraph_format.space_after=Pt(6)
+                p=doc.add_paragraph(); p.alignment=WD_ALIGN_PARAGRAPH.CENTER
+                run=p.add_run(f"{project_title.upper()}\n\nBY\n\n{student_name.upper()}\n{reg_no}\n{dept.upper()}\n{selected_uni_format.upper()}"); run.bold=True; run.font.size=Pt(size_choice+2)
+                doc.add_page_break()
+                text_parts = re.split(r'\n\s*REFERENCES\s*\n|\n\s*REFERENCE\s*\n|\n\s*BIBLIOGRAPHY\s*\n', full, flags=re.IGNORECASE)
+                main_body = text_parts[0] if text_parts else full
+                ref_section = text_parts[1] if len(text_parts)>1 else ""
+                for para_text in main_body.split("\n\n"):
+                    para_text=para_text.strip()
+                    if not para_text: continue
+                    para=doc.add_paragraph()
+                    para.add_run(para_text)
+                    para.paragraph_format.line_spacing=spacing_choice
+                no_ref_header = not ref_section.strip()
+                if not no_ref_header:
+                    doc.add_page_break()
+                    h=doc.add_paragraph(); r=h.add_run("REFERENCES"); r.bold=True; r.font.size=Pt(size_choice+1); h.alignment=WD_ALIGN_PARAGRAPH.CENTER
+                    refs = [rl.strip() for rl in ref_section.split("\n") if rl.strip()]
+                    if auto_sort and ref_style in ["APA 7th","APA 6th","Harvard","MLA 9th"]:
+                        refs = sorted(refs, key=lambda x: x.lower())
+                    for ref_line in refs:
+                        p=doc.add_paragraph()
+                        p.add_run(ref_line)
+                        if ref_style in ["APA 7th","APA 6th","Harvard"]:
+                            p.paragraph_format.left_indent=Pt(36); p.paragraph_format.first_line_indent=Pt(-36)
+                            p.paragraph_format.line_spacing=2.0; p.paragraph_format.space_after=Pt(0)
+                        elif ref_style in ["MLA 9th","Chicago 17th","Turabian"]:
+                            p.paragraph_format.left_indent=Pt(36); p.paragraph_format.first_line_indent=Pt(-36)
+                            p.paragraph_format.line_spacing=2.0
+                        elif ref_style in ["Vancouver","IEEE","AMA 11th"]:
+                            p.paragraph_format.left_indent=Pt(18); p.paragraph_format.first_line_indent=Pt(0)
+                            p.paragraph_format.line_spacing=1.0; p.paragraph_format.space_after=Pt(3)
+                        elif ref_style == "OSCOLA":
+                            p.paragraph_format.left_indent=Pt(0); p.paragraph_format.first_line_indent=Pt(0)
+                            p.paragraph_format.line_spacing=1.0
+                        else:
+                            p.paragraph_format.line_spacing=spacing_choice
+                bio=io.BytesIO(); doc.save(bio)
+                safe_uni = re.sub(r'[^A-Za-z0-9]+', '_', selected_uni_format).strip('_')
+                safe_ref = re.sub(r'[^A-Za-z0-9]+', '_', ref_style).strip('_')
+                st.session_state["formatted_doc"] = {
+                    "data": bio.getvalue(),
+                    "name": f"{reg_no}_Chapters1-5_{safe_uni}_{safe_ref}_CitationsIntact.docx",
+                    "label": f"📄 Download Formatted 1-5 — {selected_uni_format} — {ref_style} — Citations Intact — No Watermark",
+                    "msg": f"✅ Formatted for {selected_uni_format} — {font_choice} {size_choice}pt {spacing_choice} spacing — References in {ref_style} — Citations intact — No Watermark",
+                    "caption": f"University Format Confirmed: {selected_uni_format} — Preserved: (Ade et al., 2020), [1] — Reference list in {ref_style}",
+                    "no_ref_header": no_ref_header,
+                }
+        fd = st.session_state.get("formatted_doc")
+        if fd:
+            if fd["no_ref_header"]:
                 st.warning("No REFERENCES header found — We formatted all as body. Include a line with REFERENCES before your list to format references separately.")
-            bio=io.BytesIO(); doc.save(bio)
-            st.success(f"✅ Formatted for {selected_uni_format} — {font_choice} {size_choice}pt {spacing_choice} spacing — References in {ref_style} — Citations intact — No Watermark")
-            st.download_button(f"📄 Download Formatted 1-5 — {selected_uni_format} — {ref_style} — Citations Intact — No Watermark", bio.getvalue(), f"{reg_no}_Chapters1-5_{selected_uni_format}_{ref_style.replace('','')}_CitationsIntact.docx", use_container_width=True)
-            st.caption(f"University Format Confirmed: {selected_uni_format} — Preserved: (Ade et al., 2020), [1] — Reference list in {ref_style}")
+            st.success(fd["msg"])
+            st.download_button(fd["label"], fd["data"], fd["name"], use_container_width=True)
+            st.caption(fd["caption"])
 
+# ---------------------------------------------------------------- TAB 5
 with tab5:
-    if not st.session_state.paid: st.markdown("<div class='locked-box'><h3>🔒 Admin Review Locked</h3></div>", unsafe_allow_html=True)
+    if not st.session_state.paid:
+        st.markdown("<div class='locked-box'><h3>🔒 Admin Review Locked</h3></div>", unsafe_allow_html=True)
+    elif "Standard" not in str(st.session_state.tier):
+        st.error("Upgrade to Standard ₦40k for Admin Review")
     else:
         st.header(f"📤 Send to Admin — {project_title}")
-        if "Standard" not in str(st.session_state.tier): st.error("Upgrade to Standard ₦40k for Admin Review"); st.stop()
         work=st.text_area("Paste work for review")
-        if st.button("Submit to Creator"): save_review([datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), uni, dept, project_title, student_email, work[:4000], st.session_state.verify_code, "", reg_no]); st.success("Submitted")
+        if st.button("Submit to Creator"):
+            if save_review([datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), uni, dept, project_title, student_email, work[:4000], st.session_state.verify_code, "", reg_no]):
+                st.success("Submitted")
+            else:
+                st.error("Could not submit right now — please send it on WhatsApp instead.")
 
+# ---------------------------------------------------------------- TAB 6
 with tab6:
     if not st.session_state.paid:
         st.markdown("<div class='locked-box'><h3>🔒 AI Checker Locked — Standard Plan ₦40k Only</h3><p>Basic ₦30k = No AI checker. Standard = AI checker + humanize on spot so supervisor does not flag you</p></div>", unsafe_allow_html=True)
+    elif "Standard" not in str(st.session_state.tier):
+        st.error("🔒 AI Checker is Standard Plan only — Upgrade to ₦40k")
     else:
-        if "Standard" not in str(st.session_state.tier):
-            st.error("🔒 AI Checker is Standard Plan only — Upgrade to ₦40k"); st.stop()
         st.header(f"🤖 AI Checker — Included in Standard — Check If Your Project Will Be Flagged — {project_title}")
         st.info("Supervisor may use Turnitin AI, ZeroGPT, Originality — We check on the spot before you submit — Included in Standard ₦40k")
         check_text = st.text_area("Paste Discussion / Chapter 4 / Full Chapters 1-5 to check — We analyze like AI detector", height=250, placeholder="Paste your Discussion from Tab 3 or formatted project...")
@@ -841,39 +941,46 @@ with tab6:
                 if burstiness < 5: ai_score += 25
                 if word_count < 100: ai_score += 10
                 ai_score = min(95, ai_score + random.randint(5,15))
-                human_score = 100 - ai_score
-                cA,cB,cC = st.columns(3)
-                with cA: st.metric("🤖 AI Likelihood", f"{ai_score}%")
-                with cB: st.metric("👤 Human Likelihood", f"{human_score}%")
-                with cC: 
-                    if ai_score < 30: st.success("✅ SAFE — Likely not flagged")
-                    elif ai_score < 60: st.warning("⚠️ MEDIUM — Rewrite some parts")
-                    else: st.error("🔴 HIGH RISK — Will likely be flagged — Rewrite needed")
-                st.divider()
-                st.subheader("How to Fix If Flagged — Humanize On The Spot")
-                st.markdown(f"""
+                humanized = None
+                if ai_score >= 30:
+                    humanized = check_text.replace("Furthermore,", "Also,").replace("Moreover,", "In addition,").replace("It is important to note that", "We observed that").replace("In conclusion,", "From our findings at "+str(uni)+",")
+                st.session_state["ai_result"] = {"ai_score": ai_score, "human_score": 100 - ai_score, "avg_sentence_len": avg_sentence_len,
+                                                 "repetitive_phrases": repetitive_phrases, "burstiness": float(burstiness), "humanized": humanized}
+        res = st.session_state.get("ai_result")
+        if res:
+            ai_score = res["ai_score"]; human_score = res["human_score"]
+            cA,cB,cC = st.columns(3)
+            with cA: st.metric("🤖 AI Likelihood", f"{ai_score}%")
+            with cB: st.metric("👤 Human Likelihood", f"{human_score}%")
+            with cC:
+                if ai_score < 30: st.success("✅ SAFE — Likely not flagged")
+                elif ai_score < 60: st.warning("⚠️ MEDIUM — Rewrite some parts")
+                else: st.error("🔴 HIGH RISK — Will likely be flagged — Rewrite needed")
+            st.divider()
+            st.subheader("How to Fix If Flagged — Humanize On The Spot")
+            st.markdown(f"""
 <div style="background:#F0FFF0; border:1px solid #4CAF50; border-radius:10px; padding:14px; font-size:14px;">
 <b>If AI Score >60%:</b><br>
-                                1. Break long sentences — Avg now {avg_sentence_len:.1f} words — aim 15-18<br>
+                                1. Break long sentences — Avg now {res['avg_sentence_len']:.1f} words — aim 15-18<br>
                                 2. Add personal observation — e.g. "In our lab at {uni}, we observed..."<br>
-                                3. Replace AI phrases: "delve", "tapestry", "in conclusion" found {repetitive_phrases} times<br>
-                                4. Vary sentence length — Burstiness now {burstiness:.1f} — mix short and long<br>
+                                3. Replace AI phrases: "delve", "tapestry", "in conclusion" found {res['repetitive_phrases']} times<br>
+                                4. Vary sentence length — Burstiness now {res['burstiness']:.1f} — mix short and long<br>
                                 5. Add specific numbers from YOUR results — e.g. "Weight_g mean 157.5" — AI detectors like specifics<br>
                                 6. Paste revised text back into Tab 3 Discussion then re-check here<br>
                                 7. Final check before submitting to supervisor
 </div>
 """, unsafe_allow_html=True)
-                if ai_score >= 30:
-                    st.subheader("Suggested Humanized Version — Edit Then Use")
-                    humanized = check_text.replace("Furthermore,", "Also,").replace("Moreover,", "In addition,").replace("It is important to note that", "We observed that").replace("In conclusion,", "From our findings at "+uni+",")
-                    st.text_area("Humanized draft — Copy to Tab 3/Tab 4:", value=humanized[:4000], height=200)
-                    doc = docx.Document()
-                    doc.add_paragraph(humanized)
-                    bio = io.BytesIO(); doc.save(bio)
-                    st.download_button("📄 Download Humanized Version — No Watermark", bio.getvalue(), f"{reg_no}_Humanized_AI_Checked.docx", use_container_width=True)
+            if res["humanized"] is not None:
+                st.subheader("Suggested Humanized Version — Edit Then Use")
+                st.text_area("Humanized draft — Copy to Tab 3/Tab 4:", value=res["humanized"][:4000], height=200)
+                hdoc = docx.Document()
+                hdoc.add_paragraph(res["humanized"])
+                hbio = io.BytesIO(); hdoc.save(hbio)
+                st.download_button("📄 Download Humanized Version — No Watermark", hbio.getvalue(), f"{reg_no}_Humanized_AI_Checked.docx", use_container_width=True)
         st.divider()
         st.caption("AI Checker included in Standard ₦40k — Basic ₦30k cannot access — We teach you to humanize using your own lab observations + specific numbers from Tab 2")
 
+# ---------------------------------------------------------------- FOOTER
 st.divider()
 st.markdown(f"""
 <div style='text-align:center; font-size:13px; color:gray;'>
