@@ -14,7 +14,7 @@ import numpy as np
 import pyreadstat
 import statsmodels.api as sm
 
-BUSINESS_NAME="ResearchHub"; APP_NAME="ResearchHub"; BUSINESS_EMAIL="support@researchhub.ng"; VERIFY_DOMAIN="researchhub.ng/verify"; ADMIN_PASSWORD="ResearchHub2026!"
+BUSINESS_NAME="Research Base HQ"; APP_NAME="Researchbasehq.org"; BUSINESS_EMAIL="support@researchbasehq.ng"; VERIFY_DOMAIN="researchbasehq.ng/verify"; ADMIN_PASSWORD="Researchbasehq2026!"
 WHATSAPP_NUMBER="2347054857303"
 WHATSAPP_DISPLAY="07054857303"
 WHATSAPP_LINK=f"https://wa.me/{WHATSAPP_NUMBER}?text=Hello%20ResearchHub%20Support,%20I%20need%20help%20with%20my%20project."
