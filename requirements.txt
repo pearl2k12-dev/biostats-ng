@@ -10,5 +10,5 @@ openpyxl
 gspread
 oauth2client
 PyPDF2
-pyython-docx
+python-docx
 requests
