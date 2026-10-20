@@ -64,11 +64,28 @@ def _connect():
     creds_dict=dict(st.secrets["gcp_service_account"])
     creds=ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client=gspread.authorize(creds)
-    return client.open_by_url(st.secrets["paysheets"]["sheet_url"])
+    target=str(st.secrets["paysheets"]["sheet_url"]).strip()
+    if target.startswith("http"): return client.open_by_url(target)
+    return client.open_by_key(target)      # also accepts just the spreadsheet ID
+
+SHEET_ERR = {"msg": ""}
 
 def get_sheet():
     try: return _connect()
-    except Exception: return None
+    except Exception as e:
+        SHEET_ERR["msg"] = f"{type(e).__name__}: {e}"
+        return None
+
+def sheet_hint(msg):
+    m = msg.lower()
+    if "paysheets" in m or "sheet_url" in m: return "The [paysheets] section with sheet_url is missing from your secrets."
+    if "gcp_service_account" in m: return "The [gcp_service_account] section is missing from your secrets."
+    if "has not been used" in m or "is disabled" in m or "accessnotconfigured" in m: return "Google Sheets API / Google Drive API are not enabled for your Google Cloud project. Enable both, wait a minute, then refresh."
+    if "spreadsheetnotfound" in m or "404" in m: return "The sheet was not found. Check sheet_url, and that the sheet is shared with the service account email as Editor."
+    if "403" in m or "permission" in m: return "Permission denied. Share the sheet with the service account email as Editor."
+    if "invalid_grant" in m or "jwt" in m or "private key" in m or "pem" in m or "asn1" in m or "could not deserialize" in m: return "The private_key in your secrets is wrong or was pasted incorrectly. Paste the NEW key exactly as in the JSON file, including the BEGIN/END lines."
+    if "nonvalidurlkey" in m or "invalid" in m and "url" in m: return "sheet_url is not a valid Google Sheets link or ID."
+    return "See the message above."
 
 def save_payment(row):
     try:
@@ -351,7 +368,10 @@ if st.session_state.is_admin:
         if st.button("Logout Creator"): st.session_state.is_admin=False; st.query_params.clear(); st.rerun()
     sh = get_sheet()
     if not sh:
-        st.error("Cannot connect to the Google Sheet. Check your secrets and that the sheet is shared with the service account as Editor."); st.stop()
+        st.error("Cannot connect to the Google Sheet.")
+        st.code(SHEET_ERR["msg"] or "No error message captured", language=None)
+        st.info("💡 " + sheet_hint(SHEET_ERR["msg"]))
+        st.stop()
     pdf = payments_df()
     if pdf is None:
         st.error("Could not read the 'Payments' tab. Check the tab name and that the sheet is shared with the service account."); st.stop()
