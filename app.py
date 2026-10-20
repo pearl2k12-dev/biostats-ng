@@ -380,6 +380,13 @@ if st.session_state.is_admin:
         st.error("Cannot connect to the Google Sheet.")
         st.code(SHEET_ERR["msg"] or "No error message captured", language=None)
         st.info("💡 " + sheet_hint(SHEET_ERR["msg"]))
+        try: st.write("**The app is signed in as (share your sheet with this email as Editor):**"); st.code(st.secrets["gcp_service_account"]["client_email"], language=None)
+        except Exception: st.warning("client_email not found in [gcp_service_account] in your secrets.")
+        try:
+            tgt = str(st.secrets["paysheets"]["sheet_url"]).strip()
+            m_id = re.search(r"/d/([A-Za-z0-9_-]+)", tgt)
+            st.write("**Spreadsheet ID the app is trying to open:**"); st.code(m_id.group(1) if m_id else tgt, language=None)
+        except Exception: st.warning("[paysheets] sheet_url not found in your secrets.")
         st.stop()
     pdf = payments_df()
     if pdf is None:
