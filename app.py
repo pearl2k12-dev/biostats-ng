@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd, requests, datetime, random, string, io, os, re, tempfile, hmac
 from urllib.parse import quote_plus
@@ -129,9 +128,17 @@ def _app_url():
     try: return st.secrets["app"]["url"]
     except Exception: return None
 
+def _paystack_key():
+    try: k = str(st.secrets["paystack"]["secret_key"])
+    except Exception: return None
+    k = k.strip().strip('"').strip("'").strip()
+    return k if k.startswith(("sk_live_", "sk_test_")) else None
+
 def initialize_paystack(email, amount_kobo, metadata=None):
     try:
-        secret=st.secrets["paystack"]["secret_key"]
+        secret=_paystack_key()
+        if not secret:
+            st.error("Payment is not set up correctly right now. Please contact support on WhatsApp."); return None, None
         headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"}
         data={"email": email, "amount": amount_kobo, "currency": "NGN", "metadata": metadata or {}}
         if _app_url(): data["callback_url"] = _app_url()
@@ -143,7 +150,8 @@ def initialize_paystack(email, amount_kobo, metadata=None):
 
 def verify_paystack(reference):
     try:
-        secret=st.secrets["paystack"]["secret_key"]
+        secret=_paystack_key()
+        if not secret: return False, {}
         r=requests.get(f"https://api.paystack.co/transaction/verify/{reference}", headers={"Authorization": f"Bearer {secret}"}, timeout=15)
         data=r.json(); return data.get("data",{}).get("status")=="success", data.get("data",{})
     except: return False, {}
