@@ -123,6 +123,50 @@ def find_payment(reg_no, title, email, code=None):
         return {"code": _cell(r, "code"), "tier": _cell(r, "tier")}
     return None
 
+
+# ---- extra helpers: payments table, reviews, sheet-safe text
+PAY_COLS = ["date","uni","dept","project_title","verify_code","email","amount_kobo","tier","reg_no","status","reference"]
+RCOL = {"date":0,"uni":1,"dept":2,"title":3,"email":4,"work":5,"code":6,"reply":7,"reg":8}
+
+def _safe_cell(v):
+    v = str(v)
+    return (" " + v) if v[:1] in ("=", "+", "-", "@") else v
+
+def _rcell(r, key):
+    i = RCOL[key]
+    return str(r[i]).strip() if len(r) > i else ""
+
+@st.cache_data(ttl=20, show_spinner=False)
+def review_rows():
+    sh = get_sheet()
+    if not sh: return None
+    try: vals = sh.worksheet("Reviews").get_all_values()
+    except Exception: return None
+    return [(i, r) for i, r in enumerate(vals, start=1) if i > 1 and any(str(c).strip() for c in r)]
+
+def _access_label(date_str):
+    d = _parse_date(date_str)
+    if d is None: return "Unknown date"
+    left = 180 - (datetime.datetime.now() - d).days
+    return f"Active ({left} days left)" if left > 0 else "Expired"
+
+def payments_df():
+    rows = payment_rows()
+    if rows is None: return None
+    data = [(list(r) + [""] * len(PAY_COLS))[:len(PAY_COLS)] for r in rows if any(str(c).strip() for c in r)]
+    df = pd.DataFrame(data, columns=PAY_COLS)
+    df["amount_naira"] = pd.to_numeric(df["amount_kobo"], errors="coerce").fillna(0) / 100
+    df["plan"] = df["tier"].apply(lambda t: "Standard" if "Standard" in str(t) else ("Basic" if "Basic" in str(t) else "Other"))
+    df["manual"] = df["reference"].astype(str).str.startswith("manual-")
+    df["access"] = df["date"].apply(_access_label)
+    return df
+
+def _tier_for(meta_tier, amount):
+    if meta_tier in PRICE_TIERS: return meta_tier
+    for k, v in PRICE_TIERS.items():
+        if v["amount"] == amount: return k
+    return list(PRICE_TIERS.keys())[0]
+
 # ---------------------------------------------------------------- PAYSTACK
 def _app_url():
     try: return st.secrets["app"]["url"]
@@ -295,15 +339,166 @@ if st.session_state.show_admin_login and not st.session_state.is_admin:
     st.markdown("### 🔒 Creator Only"); pwd=st.text_input("Creator Password",type="password")
     if st.button("Login as Creator"):
         if ADMIN_PASSWORD and hmac.compare_digest(pwd, str(ADMIN_PASSWORD)): st.session_state.is_admin=True; st.session_state.show_admin_login=False; st.rerun()
-        else: st.error("Denied"); st.stop()
+        else: st.error("Denied")
+    st.stop()   # show ONLY the login box until the correct password is entered
 
 if st.session_state.is_admin:
-    st.subheader("📊 CREATOR DASHBOARD"); sh=get_sheet()
-    if sh:
-        try:
-            pay_df=pd.DataFrame(sh.worksheet("Payments").get_all_records()); st.metric("Total Paid", len(pay_df)); st.dataframe(pay_df.tail(30))
-        except Exception as e: st.error(f"{e}")
-    if st.button("Logout Creator"): st.session_state.is_admin=False; st.query_params.clear(); st.rerun()
+    h1, h2, h3 = st.columns([4, 1, 1])
+    with h1: st.subheader("📊 CREATOR DASHBOARD")
+    with h2:
+        if st.button("🔄 Refresh data"): payment_rows.clear(); review_rows.clear(); st.rerun()
+    with h3:
+        if st.button("Logout Creator"): st.session_state.is_admin=False; st.query_params.clear(); st.rerun()
+    sh = get_sheet()
+    if not sh:
+        st.error("Cannot connect to the Google Sheet. Check your secrets and that the sheet is shared with the service account as Editor."); st.stop()
+    pdf = payments_df()
+    if pdf is None:
+        st.error("Could not read the 'Payments' tab. Check the tab name and that the sheet is shared with the service account."); st.stop()
+    ok_df = pdf[pdf["status"] == "success"]
+    atab1, atab2, atab3, atab4 = st.tabs(["📈 Overview", "🔎 Search payments", "🛠️ Grant / restore access", "📥 Review inbox"])
+
+    # ---------- Overview
+    with atab1:
+        if ok_df.empty:
+            st.info("No successful payments recorded yet.")
+        else:
+            now = datetime.datetime.now()
+            dates = pd.to_datetime(ok_df["date"].astype(str).str.split(" ").str[0], errors="coerce")
+            this_month = ok_df[(dates.dt.year == now.year) & (dates.dt.month == now.month)]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Successful payments", len(ok_df))
+            m2.metric("Total revenue", f"₦{ok_df['amount_naira'].sum():,.0f}")
+            m3.metric("This month", f"₦{this_month['amount_naira'].sum():,.0f}", f"{len(this_month)} sales", delta_color="off")
+            m4.metric("Manual grants", int(ok_df["manual"].sum()))
+            st.markdown("#### Basic vs Standard")
+            summary = ok_df.groupby("plan").agg(Sales=("plan", "size"), Revenue=("amount_naira", "sum")).reset_index()
+            summary["Revenue"] = summary["Revenue"].apply(lambda x: f"₦{x:,.0f}")
+            summary.columns = ["Plan", "Sales", "Revenue"]
+            st.dataframe(summary, use_container_width=True, hide_index=True)
+            monthly = ok_df.assign(month=dates.dt.strftime("%Y-%m")).groupby("month")["amount_naira"].sum()
+            if not monthly.empty:
+                st.markdown("#### Revenue by month (₦)")
+                st.bar_chart(monthly)
+            st.markdown("#### Latest 10 payments")
+            st.dataframe(ok_df.iloc[::-1].head(10)[["date", "reg_no", "email", "project_title", "plan", "amount_naira", "access"]], use_container_width=True, hide_index=True)
+
+    # ---------- Search
+    with atab2:
+        q = st.text_input("Search by reg number, email, project title, verification code or reference", key="adm_search").strip().lower()
+        view = pdf.iloc[::-1]
+        if q:
+            cols = ["reg_no", "email", "project_title", "verify_code", "reference", "uni"]
+            mask = view[cols].apply(lambda c: c.astype(str).str.lower().str.contains(q, regex=False)).any(axis=1)
+            view = view[mask]
+        st.caption(f"{len(view)} result(s)")
+        show_cols = ["date", "reg_no", "email", "project_title", "uni", "plan", "amount_naira", "status", "access", "verify_code", "reference"]
+        st.dataframe(view[show_cols], use_container_width=True, hide_index=True)
+        if len(view):
+            st.download_button("⬇️ Download these results (CSV)", view[show_cols].to_csv(index=False).encode("utf-8"), "payments.csv", mime="text/csv")
+
+    # ---------- Grant / restore
+    with atab3:
+        st.markdown("#### 1️⃣ Student paid on Paystack but access did not work")
+        st.caption("Paste the Paystack reference (from the student's receipt or your Paystack dashboard). It is confirmed with Paystack before anything is recorded.")
+        rec_ref = st.text_input("Paystack reference", key="rec_ref_in").strip()
+        if st.button("🔎 Look up reference") and rec_ref:
+            ok_p, d_p = verify_paystack(rec_ref)
+            st.session_state["rec_lookup"] = {"ref": rec_ref, "ok": ok_p, "data": d_p}
+        lk = st.session_state.get("rec_lookup")
+        if lk:
+            ref = lk["ref"]; d = lk["data"]
+            if not lk["ok"]:
+                st.error("Paystack does not show this reference as a successful payment.")
+            elif reference_used(ref):
+                st.info("This reference is already recorded. Search for it in the 'Search payments' tab.")
+            else:
+                meta = d.get("metadata") if isinstance(d.get("metadata"), dict) else {}
+                st.success(f"Paystack confirms a successful payment of ₦{(d.get('amount') or 0) / 100:,.0f} from {(d.get('customer') or {}).get('email', 'unknown email')}.")
+                st.caption("Check or complete the details below, then record it.")
+                r_reg = st.text_input("Registration number", value=str(meta.get("reg_no", "")), key=f"rec_reg_{ref}").strip()
+                r_title = st.text_input("Project title (exactly as the student typed it)", value=str(meta.get("project_title", "")), key=f"rec_title_{ref}").strip()
+                r_email = st.text_input("Email", value=(d.get("customer") or {}).get("email", ""), key=f"rec_email_{ref}").strip()
+                r_uni = st.text_input("University", value=str(meta.get("uni", "")), key=f"rec_uni_{ref}").strip()
+                r_dept = st.text_input("Department", value=str(meta.get("dept", "")), key=f"rec_dept_{ref}").strip()
+                tiers = list(PRICE_TIERS.keys())
+                r_tier = st.selectbox("Plan", tiers, index=tiers.index(_tier_for(meta.get("tier", ""), d.get("amount"))), key=f"rec_tier_{ref}")
+                if st.button("✅ Record payment and grant access", key=f"rec_save_{ref}"):
+                    if not (r_reg and r_title and "@" in r_email):
+                        st.error("Fill in the registration number, project title and a valid email.")
+                    else:
+                        paid_at = str(d.get("paid_at") or "")
+                        when = f"{paid_at[:10]} {paid_at[11:16]}" if len(paid_at) >= 16 else datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                        vc = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+                        if save_payment([when, r_uni, r_dept, r_title, vc, r_email, str(d.get("amount", 0)), r_tier, r_reg, "success", ref]):
+                            payment_rows.clear()
+                            st.success(f"Recorded. Verification code: {vc}. The student can now enter the same Reg No, Project Title and Email to restore access.")
+                        else:
+                            st.error("Could not write to the Payments sheet. Check sharing and the tab name.")
+        st.divider()
+        st.markdown("#### 2️⃣ Grant or renew access manually")
+        st.caption("For bank-transfer payments, goodwill access, or renewing an expired project. Enter the amount received so it counts in your revenue (leave 0 for free access).")
+        g1, g2 = st.columns(2)
+        with g1:
+            m_reg = st.text_input("Registration number", key="mg_reg").strip()
+            m_email = st.text_input("Student email", key="mg_email").strip()
+            m_uni = st.text_input("University", key="mg_uni").strip()
+            m_amount = st.number_input("Amount received (₦)", min_value=0, step=1000, value=0, key="mg_amount")
+        with g2:
+            m_title = st.text_input("Project title (exactly as the student will type it)", key="mg_title").strip()
+            m_dept = st.text_input("Department", key="mg_dept").strip()
+            tiers = list(PRICE_TIERS.keys())
+            m_tier = st.selectbox("Plan", tiers, index=1, key="mg_tier")
+            m_note = st.text_input("Note (optional, e.g. 'bank transfer')", key="mg_note").strip()
+        if m_reg and m_title and "@" in m_email:
+            existing = find_payment(m_reg, m_title, m_email)
+            if existing:
+                st.warning(f"This student already has active access (code {existing['code']}). Granting again starts a new 180-day period.")
+        if st.button("✅ Grant access", key="mg_go"):
+            if not (m_reg and len(m_title) > 5 and "@" in m_email):
+                st.error("Fill in the registration number, a project title (more than 5 characters) and a valid email.")
+            else:
+                vc = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+                ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+                note = re.sub(r'[^A-Za-z0-9]+', '-', m_note).strip('-')[:30]
+                ref_val = f"manual-{ts}" + (f"-{note}" if note else "")
+                if save_payment([datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), m_uni, m_dept, m_title, vc, m_email, str(int(m_amount) * 100), m_tier, m_reg, "success", ref_val]):
+                    payment_rows.clear()
+                    st.success(f"Access granted. Verification code: {vc}. The student enters the same Reg No, Project Title and Email on the site and access restores automatically.")
+                else:
+                    st.error("Could not write to the Payments sheet. Check sharing and the tab name.")
+
+    # ---------- Review inbox
+    with atab4:
+        rr = review_rows()
+        if rr is None:
+            st.error("Could not read the 'Reviews' tab. Check the tab name and sharing.")
+        else:
+            pending = [(n, r) for n, r in rr if not _rcell(r, "reply")]
+            answered = [(n, r) for n, r in rr if _rcell(r, "reply")]
+            c_a, c_b = st.columns(2)
+            c_a.metric("Waiting for reply", len(pending)); c_b.metric("Answered", len(answered))
+            which = st.radio("Show", ["Waiting for reply", "Answered", "All"], horizontal=True, key="rv_filter")
+            chosen = pending if which == "Waiting for reply" else (answered if which == "Answered" else rr)
+            chosen = list(reversed(chosen))[:30]
+            if not chosen: st.info("Nothing here.")
+            st.caption("Showing the 30 newest.")
+            for n, r in chosen:
+                icon = "✅" if _rcell(r, "reply") else "🟡"
+                with st.expander(f"{icon} {_rcell(r, 'date')} — {_rcell(r, 'reg')} — {_rcell(r, 'title')[:60]}"):
+                    st.write(f"**Email:** {_rcell(r, 'email')}  |  **University:** {_rcell(r, 'uni')}  |  **Dept:** {_rcell(r, 'dept')}  |  **Code:** {_rcell(r, 'code')}")
+                    st.text_area("Submitted work", value=_rcell(r, "work"), height=200, disabled=True, key=f"rv_work_{n}")
+                    reply = st.text_area("Your reply / corrections", value=_rcell(r, "reply"), height=160, key=f"rv_reply_{n}")
+                    if st.button("Save reply", key=f"rv_save_{n}"):
+                        if not reply.strip():
+                            st.error("Write a reply first.")
+                        else:
+                            try:
+                                sh.worksheet("Reviews").update_cell(n, RCOL["reply"] + 1, _safe_cell(reply.strip())[:4000])
+                                review_rows.clear()
+                                st.success("Reply saved. The student sees it in their Send to Admin tab.")
+                            except Exception as e:
+                                st.error(f"Could not save the reply: {e}")
     st.stop()
 
 # ---------------------------------------------------------------- RETURN FROM PAYSTACK (runs before the input widgets)
@@ -914,12 +1109,27 @@ with tab5:
         st.error("Upgrade to Standard ₦40k for Admin Review")
     else:
         st.header(f"📤 Send to Admin — {project_title}")
-        work=st.text_area("Paste work for review")
+        work=st.text_area("Paste work for review", height=200)
+        st.caption("Only the first 4,000 characters are sent. For longer work, send the file on WhatsApp.")
         if st.button("Submit to Creator"):
-            if save_review([datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), uni, dept, project_title, student_email, work[:4000], st.session_state.verify_code, "", reg_no]):
-                st.success("Submitted")
+            if not work.strip():
+                st.warning("Paste your work first")
+            elif save_review([datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), uni, dept, project_title, student_email, _safe_cell(work.strip())[:4000], st.session_state.verify_code, "", reg_no]):
+                review_rows.clear()
+                st.success("Submitted — the admin's reply will appear below.")
             else:
                 st.error("Could not submit right now — please send it on WhatsApp instead.")
+        st.divider()
+        st.subheader("Your submissions & admin replies")
+        if st.button("🔄 Check for replies"): review_rows.clear()
+        mine = [(n, r) for n, r in (review_rows() or []) if _rcell(r, "code") == str(st.session_state.verify_code) and _rcell(r, "reg").lower() == reg_no.strip().lower()]
+        if not mine:
+            st.caption("No submissions yet.")
+        for n, r in reversed(mine):
+            with st.expander(f"{_rcell(r, 'date')} — {_rcell(r, 'work')[:70]}…"):
+                st.text(_rcell(r, "work"))
+                if _rcell(r, "reply"): st.success(_rcell(r, "reply"))
+                else: st.info("⏳ Waiting for the admin's reply")
 
 # ---------------------------------------------------------------- TAB 6
 with tab6:
