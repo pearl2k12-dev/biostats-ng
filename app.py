@@ -58,10 +58,19 @@ def parse_ch3(text):
     return {"methods":m,"dv_text":dv.group(1) if dv else ""}
 
 # ---------------------------------------------------------------- GOOGLE SHEETS
+def _clean_private_key(pk):
+    """Rebuild a clean PEM from however the key was pasted (missing header, literal \\n, stray spaces/quotes)."""
+    pk = str(pk).strip().strip('"').strip("'").replace("\\n", "\n")
+    body = pk.replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "")
+    body = "".join(body.split())
+    lines = [body[i:i+64] for i in range(0, len(body), 64)]
+    return "-----BEGIN PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END PRIVATE KEY-----\n"
+
 @st.cache_resource(show_spinner=False)
 def _connect():
     scope=["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
     creds_dict=dict(st.secrets["gcp_service_account"])
+    creds_dict["private_key"]=_clean_private_key(creds_dict.get("private_key", ""))
     creds=ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client=gspread.authorize(creds)
     target=str(st.secrets["paysheets"]["sheet_url"]).strip()
