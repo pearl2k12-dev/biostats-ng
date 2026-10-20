@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd, requests, datetime, random, string, io, os, re, tempfile, hmac
 from urllib.parse import quote_plus
@@ -27,7 +28,7 @@ TEST_MODE = bool(_secret("test_mode", False))        # true only in your LOCAL s
 BUSINESS_NAME="Research Base HQ"; APP_NAME="Research Base HQ"; BUSINESS_EMAIL="support@researchbasehq.ng"; VERIFY_DOMAIN="researchbasehq.ng/verify"
 WHATSAPP_NUMBER="2347054857303"
 WHATSAPP_DISPLAY="07054857303"
-WHATSAPP_LINK=f"https://wa.me/{WHATSAPP_NUMBER}?text=Hello%20ResearchHub%20Support,%20I%20need%20help%20with%20my%20project."
+WHATSAPP_LINK=f"https://wa.me/{WHATSAPP_NUMBER}?text=Hello%20Research%20Base%20HQ%20Support,%20I%20need%20help%20with%20my%20project."
 UNIVERSITIES=["University of Port Harcourt","University of Lagos","University of Ibadan","University of Benin","University of Nigeria Nsukka","Nnamdi Azikiwe University","Obafemi Awolowo University","Ahmadu Bello University","University of Calabar","University of Jos","University of Ilorin","University of Uyo","Rivers State University","Ignatius Ajuru University","Other"]
 DEPARTMENTS=["Nursing","Medicine","Physiology","Anatomy","Pharmacy","Public Health","Medical Lab Science","Radiography","Biochemistry","Microbiology","Pharmacology","Other"]
 PRICE_TIERS = {"Basic - ₦30,000 (Analyse + Format)": {"amount": 3000000, "display": 30000}, "Standard - ₦40,000 (Most Popular + AI Checker)": {"amount": 4000000, "display": 40000}}
@@ -399,7 +400,7 @@ if not st.session_state.paid:
     st.subheader("💸 Why ₦30k Saves You Money")
     a,b=st.columns(2)
     with a: st.markdown("""<div style="background:white; border:1px solid #eee; border-radius:12px; padding:15px;"><h4>❌ Without (Separate)</h4><div>📊 Analyst ₦35k-₦60k</div><div>📄 Formatting ₦15k</div><div>📚 Discussion ₦15k + AI check ₦5k</div><hr><b>Total ₦80k-₦110k</b></div>""", unsafe_allow_html=True)
-    with b: st.markdown("""<div style="background:#E8F5E9; border:2px solid #185ADB; border-radius:12px; padding:15px;"><h4>✅ With ResearchHub</h4><div>📊 Correct Order: Descriptive → Group → ANOVA → Tukey ✅</div><div>🏛️ Choose University Format on Spot ✅</div><div>🤖 AI Checker included (Standard) ✅</div><div>🔒 Variable Map — No analyst ✅</div><hr><b>Total 3 Hours — ₦30,000 — Save ₦50k+</b></div>""", unsafe_allow_html=True)
+    with b: st.markdown("""<div style="background:#E8F5E9; border:2px solid #185ADB; border-radius:12px; padding:15px;"><h4>✅ With Research Base HQ</h4><div>📊 Correct Order: Descriptive → Group → ANOVA → Tukey ✅</div><div>🏛️ Choose University Format on Spot ✅</div><div>🤖 AI Checker included (Standard) ✅</div><div>🔒 Variable Map — No analyst ✅</div><hr><b>Total 3 Hours — ₦30,000 — Save ₦50k+</b></div>""", unsafe_allow_html=True)
     st.divider(); st.subheader("💰 Choose Plan — Per Project Topic — What you get")
     p1,p2=st.columns(2)
     with p1:
@@ -474,7 +475,7 @@ def render_upload_tab():
         var_map.to_excel(writer, sheet_name='Variable_Map', index=False)
         instructions = pd.DataFrame({"Instruction": ["1. Data sheet: First row = variable names — MUST match Variable_Map", "2. Variable_Map sheet: List EVERY variable — Role MUST be one of: Dependent (1 only), Independent, Group, Dose, Categorical, Subject_ID (Rat_ID), Time", "3. For Rat studies: Group = Control, Low, High — for ANOVA", "4. For Rat studies: Rat_ID = R001 etc — for tracking", "5. Type: Scale (numbers), Nominal (Male/Female, Control/Low/High), Ordinal (Day)", "6. CORRECT ORDER in thesis: Descriptive → Descriptive by Group → Frequency → ANOVA → Tukey", "7. This map stops you going to analyst — you already defined DV, IV, Group like analyst asks"]})
         instructions.to_excel(writer, sheet_name='Instructions', index=False)
-    st.download_button(f"📥 Download Template for {study_type.split('(')[0]} — Data + Variable_Map", data=tmpl_buf.getvalue(), file_name=f"ResearchHub_Template_{'Human' if 'Human' in study_type else 'Rat'}.xlsx", use_container_width=True, type="primary")
+    st.download_button(f"📥 Download Template for {study_type.split('(')[0]} — Data + Variable_Map", data=tmpl_buf.getvalue(), file_name=f"ResearchBaseHQ_Template_{'Human' if 'Human' in study_type else 'Rat'}.xlsx", use_container_width=True, type="primary")
     c1,c2=st.columns(2)
     with c1: up=st.file_uploader("Upload Your Filled Template .xlsx — Must have Data + Variable_Map", type=["xlsx"])
     with c2: ch3_up=st.file_uploader("Upload Chapter 3 (PDF/DOCX)", type=["pdf","docx"])
@@ -781,8 +782,8 @@ References for discussion (from your similar articles — format in Tab 4 with 1
         st.divider()
         st.markdown(f"""
 <div style="text-align:center; font-size:12px; color:gray;">
-<b>ResearchHub workflow with 5 sources:</b><br>
-        ResearchHub (Descriptive → Group → ANOVA → Tukey correct order) → PubMed (biomedical) + Google Scholar (most cited) + Consensus.ai (Yes/No) → Copy 2-3 real articles → Jenni.ai (writes discussion with those citations intact) → ResearchHub Tab 4 (formats References into 10+ styles — APA 7th, Vancouver, Harvard etc.) — No watermark<br>
+<b>Research Base HQ workflow with 5 sources:</b><br>
+        Research Base HQ (Descriptive → Group → ANOVA → Tukey correct order) → PubMed (biomedical) + Google Scholar (most cited) + Consensus.ai (Yes/No) → Copy 2-3 real articles → Jenni.ai (writes discussion with those citations intact) → Research Base HQ Tab 4 (formats References into 10+ styles — APA 7th, Vancouver, Harvard etc.) — No watermark<br>
 </div>
 """, unsafe_allow_html=True)
 
