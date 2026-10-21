@@ -16,6 +16,8 @@ import statsmodels.api as sm
 import uuid, hashlib, smtplib, ssl
 from email.message import EmailMessage
 from sqlalchemy import create_engine, text as sql_text
+from sqlalchemy.exc import IntegrityError
+from urllib.parse import quote
 
 st.set_page_config(page_title="Research Base HQ | Research Project Support", page_icon="📘", layout="wide", initial_sidebar_state="collapsed")
 
@@ -48,7 +50,10 @@ def init_app_db():
     statements = [
         "CREATE TABLE IF NOT EXISTS leads (id VARCHAR(36) PRIMARY KEY, email VARCHAR(320) NOT NULL, source VARCHAR(120), campaign VARCHAR(120), consent BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS funnel_events (id VARCHAR(36) PRIMARY KEY, event_name VARCHAR(100) NOT NULL, source VARCHAR(120), campaign VARCHAR(120), email_hash VARCHAR(64), project_key_hash VARCHAR(64), metadata TEXT, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-        "CREATE TABLE IF NOT EXISTS project_progress (project_key_hash VARCHAR(64) PRIMARY KEY, stage VARCHAR(80) NOT NULL DEFAULT 'project_started', source VARCHAR(120), campaign VARCHAR(120), updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        "CREATE TABLE IF NOT EXISTS project_progress (project_key_hash VARCHAR(64) PRIMARY KEY, stage VARCHAR(80) NOT NULL DEFAULT 'project_started', source VARCHAR(120), campaign VARCHAR(120), updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS payment_ledger (reference VARCHAR(120) PRIMARY KEY, amount_kobo BIGINT NOT NULL, currency VARCHAR(3) NOT NULL, status VARCHAR(24) NOT NULL, email_hash VARCHAR(64), tier VARCHAR(160), reg_hash VARCHAR(64), project_hash VARCHAR(64), recorded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS project_snapshots (project_key_hash VARCHAR(64) PRIMARY KEY, email_hash VARCHAR(64), project_title TEXT, state_json TEXT NOT NULL, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS app_error_events (id VARCHAR(36) PRIMARY KEY, error_code VARCHAR(100), stage VARCHAR(100), project_key_hash VARCHAR(64), created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
     ]
     with _db_engine().begin() as conn:
         for statement in statements:
@@ -74,6 +79,29 @@ def track_event(event_name, email=None, project_key=None, metadata=None):
     except Exception as exc:
         # Analytics failure must never prevent the research workflow.
         st.session_state['analytics_warning'] = f"Analytics store unavailable: {type(exc).__name__}"
+
+def save_project_snapshot(project_key, email, title, state):
+    """Persist small non-dataset project state. Do not save raw participant data here."""
+    try:
+        import json
+        init_app_db()
+        safe_state = {k: state.get(k) for k in ("stage", "analysis_confirmed", "confirmed_methods", "selected_university_format") if k in state}
+        payload = json.dumps(safe_state, ensure_ascii=False, default=str)[:12000]
+        with _db_engine().begin() as conn:
+            conn.execute(sql_text("INSERT INTO project_snapshots (project_key_hash,email_hash,project_title,state_json,updated_at) VALUES (:key,:email,:title,:state,CURRENT_TIMESTAMP) ON CONFLICT(project_key_hash) DO UPDATE SET email_hash=excluded.email_hash, project_title=excluded.project_title, state_json=excluded.state_json, updated_at=CURRENT_TIMESTAMP"), {"key":_hash_value(project_key), "email":_hash_value(email), "title":str(title or "")[:500], "state":payload})
+        return True
+    except Exception as exc:
+        st.session_state["snapshot_warning"] = f"Project progress could not be saved ({type(exc).__name__}). Keep downloaded copies of reports."
+        return False
+
+def record_app_error(error_code, stage, project_key=None):
+    """Store only a generic error code and stage, not stack traces, dataset contents, or personal data."""
+    try:
+        init_app_db()
+        with _db_engine().begin() as conn:
+            conn.execute(sql_text("INSERT INTO app_error_events (id,error_code,stage,project_key_hash) VALUES (:id,:code,:stage,:key)"), {"id":str(uuid.uuid4()), "code":str(error_code)[:100], "stage":str(stage)[:100], "key":_hash_value(project_key)})
+    except Exception:
+        pass
 
 def send_resource_email(email):
     """Send the requested resource by SMTP when configured. No marketing sequence is sent here."""
@@ -227,11 +255,44 @@ def sheet_hint(msg):
     return "See the message above."
 
 def save_payment(row):
+    """Record a payment in the durable unique-reference ledger before mirroring it to Sheets.
+
+    If either storage system fails, access remains locked and the transaction must be reconciled.
+    Configure managed PostgreSQL in production; local SQLite is for development only.
+    """
     try:
-        sh=get_sheet()
-        if sh: sh.worksheet("Payments").append_row(row); return True
-    except: pass
-    return False
+        if len(row) < 11:
+            return False
+        ref = str(row[10]).strip()
+        if not ref or len(ref) > 120 or not re.fullmatch(r"[A-Za-z0-9_-]{3,120}", ref):
+            return False
+        init_app_db()
+        amount = int(str(row[6]).strip())
+        if amount < 0:
+            return False
+        tier = str(row[7])[:160]
+        email = str(row[5]).strip().lower()
+        reg = str(row[8]).strip()
+        title = str(row[3]).strip()
+        # Unique primary key makes duplicate callbacks fail closed at the database layer.
+        with _db_engine().begin() as conn:
+            conn.execute(sql_text("INSERT INTO payment_ledger (reference,amount_kobo,currency,status,email_hash,tier,reg_hash,project_hash) VALUES (:ref,:amount,'NGN','success',:email_hash,:tier,:reg_hash,:project_hash)"), {
+                'ref': ref, 'amount': amount, 'email_hash': _hash_value(email), 'tier': tier,
+                'reg_hash': _hash_value(reg), 'project_hash': _hash_value(reg + '|' + title)
+            })
+        sh = get_sheet()
+        if not sh:
+            return False
+        sh.worksheet("Payments").append_row(row, value_input_option="RAW")
+        return True
+    except IntegrityError:
+        # Duplicate reference: do not create a second entitlement.
+        return False
+    except Exception as exc:
+        # Do not leak credentials, payment payloads or raw exceptions to visitors.
+        try: st.session_state['payment_storage_warning'] = type(exc).__name__
+        except Exception: pass
+        return False
 
 def save_review(row):
     try:
@@ -335,26 +396,53 @@ def _paystack_key():
     return k if k.startswith(("sk_live_", "sk_test_")) else None
 
 def initialize_paystack(email, amount_kobo, metadata=None):
+    """Initialise a fixed-price NGN transaction with strict input and response checks."""
     try:
-        secret=_paystack_key()
+        email = str(email or '').strip().lower()
+        amount_kobo = int(amount_kobo)
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email) or amount_kobo not in {v["amount"] for v in PRICE_TIERS.values()}:
+            st.error("Please check your email and selected plan, then try again.")
+            return None, None
+        secret = _paystack_key()
         if not secret:
-            st.error("Payment is not set up correctly right now. Please contact support on WhatsApp."); return None, None
-        headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"}
-        data={"email": email, "amount": amount_kobo, "currency": "NGN", "metadata": metadata or {}}
+            st.error("Payment is temporarily unavailable. Please contact support.")
+            return None, None
+        headers = {"Authorization": f"Bearer {secret}", "Content-Type": "application/json"}
+        data = {"email": email, "amount": amount_kobo, "currency": "NGN", "metadata": metadata or {}}
         if _app_url(): data["callback_url"] = _app_url()
-        r=requests.post("https://api.paystack.co/transaction/initialize", headers=headers, json=data, timeout=20)
-        res=r.json()
-        if res.get("status"): return res["data"]["authorization_url"], res["data"]["reference"]
-        else: st.error(res.get("message")); return None, None
-    except Exception as e: st.error(f"{e}"); return None, None
+        response = requests.post("https://api.paystack.co/transaction/initialize", headers=headers, json=data, timeout=(5, 20))
+        response.raise_for_status()
+        res = response.json()
+        pdata = res.get("data") or {}
+        auth_url = pdata.get("authorization_url")
+        reference = pdata.get("reference")
+        if res.get("status") and auth_url and reference and str(auth_url).startswith("https://"):
+            return auth_url, reference
+        st.error("Payment could not be started. Please try again or contact support.")
+        return None, None
+    except Exception:
+        st.error("Payment service is temporarily unavailable. No payment has been confirmed; please try again shortly.")
+        return None, None
 
 def verify_paystack(reference):
+    """Verify a Paystack reference server-side; never trust callback parameters alone."""
+    reference = str(reference or '').strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{3,120}", reference):
+        return False, {}
     try:
-        secret=_paystack_key()
+        secret = _paystack_key()
         if not secret: return False, {}
-        r=requests.get(f"https://api.paystack.co/transaction/verify/{reference}", headers={"Authorization": f"Bearer {secret}"}, timeout=15)
-        data=r.json(); return data.get("data",{}).get("status")=="success", data.get("data",{})
-    except: return False, {}
+        response = requests.get(
+            "https://api.paystack.co/transaction/verify/" + quote(reference, safe=""),
+            headers={"Authorization": f"Bearer {secret}"}, timeout=(5, 15)
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") or {}
+        valid = bool(payload.get("status")) and data.get("status") == "success" and data.get("reference") == reference
+        return valid, data if valid else {}
+    except Exception:
+        return False, {}
 
 # ---------------------------------------------------------------- ANALYSIS
 def spss_descriptive_table(df):
@@ -405,21 +493,28 @@ def run_inferential_correct_order(df, dv, ivs, group_col, methods):
                     out['ANOVA']={'F':round(float(f),3),'Sig.':round(float(p),6),'factor':gc,
                                   'Levene statistic':round(float(lev_stat),3),'Levene p-value':round(float(lev_p),6),
                                   'group sizes':[int(len(g)) for g in groups]}
-                    if p < 0.05 and "Tukey" in methods and lev_p >= 0.05:
-                        try:
-                            from statsmodels.stats.multicomp import pairwise_tukeyhsd
-                            tukey_df=df[[gc, dv]].copy()
-                            tukey_df[dv]=pd.to_numeric(tukey_df[dv], errors='coerce')
-                            tukey_df=tukey_df.dropna()
-                            if len(tukey_df)>=3:
-                                tukey = pairwise_tukeyhsd(endog=tukey_df[dv], groups=tukey_df[gc], alpha=0.05)
-                                out['PostHoc_Tukey_Text']=tukey.summary().as_text()
-                                out['PostHoc_df']=pd.DataFrame(data=tukey._results_table.data[1:], columns=tukey._results_table.data[0])
-                        except Exception as e:
-                            out['PostHoc_Error']=str(e)
-                    elif p < 0.05 and "Tukey" in methods and lev_p < 0.05:
-                        out['PostHoc_Error']='Tukey HSD was not run because the equal-variance check was not met. Ask whether a variance-robust post-hoc procedure is appropriate.'
-            except: pass
+                    out['ANOVA']['Caution'] = 'This is a screening result, not proof that assumptions or study design are appropriate. Check independence, residual behaviour, group sizes, and the approved analysis plan.'
+                    if "Tukey" in methods:
+                        if p >= 0.05:
+                            out['PostHoc_Note'] = 'Tukey HSD was not run because the omnibus ANOVA was not statistically significant at alpha=0.05. Confirm this rule with your approved analysis plan.'
+                        elif lev_p < 0.05:
+                            out['PostHoc_Error'] = 'Tukey HSD was not run because the equal-variance check raised concern. Do not treat Levene alone as a complete assumption check; ask whether Welch ANOVA and a suitable robust post-hoc method are appropriate.'
+                        else:
+                            try:
+                                from statsmodels.stats.multicomp import pairwise_tukeyhsd
+                                tukey_df=df[[gc, dv]].copy()
+                                tukey_df[dv]=pd.to_numeric(tukey_df[dv], errors='coerce')
+                                tukey_df=tukey_df.dropna()
+                                if tukey_df[gc].nunique() < 2 or tukey_df.groupby(gc)[dv].size().min() < 2:
+                                    out['PostHoc_Error'] = 'Not enough observations in each group for the requested post-hoc procedure.'
+                                else:
+                                    tukey = pairwise_tukeyhsd(endog=tukey_df[dv], groups=tukey_df[gc], alpha=0.05)
+                                    out['PostHoc_Tukey_Text']=tukey.summary().as_text()
+                                    out['PostHoc_df']=pd.DataFrame(data=tukey._results_table.data[1:], columns=tukey._results_table.data[0])
+                            except Exception as e:
+                                out['PostHoc_Error']='The post-hoc calculation could not be completed. Check the data and analysis plan (' + type(e).__name__ + ').'
+            except Exception as e:
+                out['ANOVA_Error'] = 'ANOVA could not be calculated for the selected data. Check group coding, missing values, sample sizes, and design (' + type(e).__name__ + ').' 
     if "T-Test" in methods:
         cat = group_col if group_col in df.columns and group_col != dv else None
         if cat and df[cat].nunique(dropna=True) == 2 and dv in df.columns:
@@ -480,9 +575,9 @@ st.markdown(f"""
 .hero {{background: radial-gradient(circle at 90% 10%, rgba(59,130,246,.42), transparent 30%), linear-gradient(125deg, #102A43 0%, #163D70 60%, #1D4ED8 100%); padding: clamp(28px, 5vw, 58px) clamp(20px, 4vw, 54px); border-radius: 24px; color: white; text-align: left; margin: 12px 0 22px; box-shadow: 0 18px 44px rgba(16,42,67,.16); }}
 .hero h1 {{ font-size: clamp(2rem, 4vw, 3.2rem); line-height: 1.08; letter-spacing: -0.04em; max-width: 800px; margin-bottom: 16px; }}
 .hero p {{ font-size: 1.08rem; line-height: 1.65; color: #E6EEF8; max-width: 760px; }}
-.app-name {{font-size:17px; line-height:1.5; font-weight:850; color:#102A43 !important; letter-spacing:.2px; background:#F0F6FF; border:1px solid #D8E6FA; border-radius:14px; padding:12px 16px; display:inline-flex; align-items:center; flex-wrap:wrap; gap:5px; margin:0 0 18px 0; max-width:100%; box-sizing:border-box; overflow:visible;}}
+.app-name {{font-size:17px; line-height:1.5; font-weight:850; color:#102A43 !important; letter-spacing:.2px; background:#F0F6FF; border:1px solid #D8E6FA; border-radius:14px; padding:12px 20px; display:inline-flex; align-items:center; justify-content:center; flex-wrap:wrap; gap:5px; margin:0 auto 18px auto; max-width:100%; box-sizing:border-box; overflow:visible; text-align:center;}}
 .app-name span {{color:#526579 !important; line-height:1.5;}}
-.rbhq-brandbar {{display:block; width:100%; margin:0 0 18px 0; padding:4px 0 2px 0; line-height:1.6; overflow:visible;}}
+.rbhq-brandbar {{display:flex; width:100%; justify-content:center; align-items:center; text-align:center; margin:0 0 18px 0; padding:4px 0 2px 0; line-height:1.6; overflow:visible;}}
 .locked-box {{background:#F8FAFC; border:1px solid #CBD5E1; border-radius:14px; padding:22px; text-align:center; margin:15px 0; color:#334155;}}
 .price-card {{border: 1px solid #D9E2EC; border-radius: 18px; padding: 24px; background: white; color:#172B4D; min-height:100%; box-shadow:0 4px 16px rgba(16,42,67,.04);}}
 .price-card.popular {{border: 2px solid #2563EB; box-shadow: 0 12px 30px rgba(37,99,235,.12);}}
@@ -504,10 +599,26 @@ for k,v in {"is_admin":False,"show_admin_login":False,"paid":False,"verify_code"
 # ---------------------------------------------------------------- ADMIN
 if st.query_params.get("admin")=="1" and not st.session_state.is_admin: st.session_state.show_admin_login=True
 if st.session_state.show_admin_login and not st.session_state.is_admin:
-    st.markdown("### 🔒 Creator Only"); pwd=st.text_input("Creator Password",type="password")
-    if st.button("Login as Creator"):
-        if ADMIN_PASSWORD and hmac.compare_digest(pwd, str(ADMIN_PASSWORD)): st.session_state.is_admin=True; st.session_state.show_admin_login=False; st.rerun()
-        else: st.error("Denied")
+    st.markdown("### 🔒 Creator Only")
+    st.caption("Administrator access is restricted. Repeated failed attempts are temporarily blocked in this browser session.")
+    st.session_state.setdefault("_admin_failed_attempts", 0)
+    st.session_state.setdefault("_admin_locked_until", 0.0)
+    import time as _time
+    locked = _time.time() < float(st.session_state.get("_admin_locked_until", 0.0))
+    pwd = st.text_input("Creator Password", type="password", disabled=locked)
+    if locked:
+        st.error("Too many failed attempts. Wait a few minutes before trying again.")
+    elif st.button("Login as Creator"):
+        if ADMIN_PASSWORD and hmac.compare_digest(pwd, str(ADMIN_PASSWORD)):
+            st.session_state.is_admin=True; st.session_state.show_admin_login=False
+            st.session_state._admin_failed_attempts = 0
+            st.rerun()
+        else:
+            st.session_state._admin_failed_attempts += 1
+            if st.session_state._admin_failed_attempts >= 5:
+                st.session_state._admin_locked_until = _time.time() + 300
+                st.session_state._admin_failed_attempts = 0
+            st.error("Login failed. Check your credentials and try again.")
     st.stop()   # show ONLY the login box until the correct password is entered
 
 if st.session_state.is_admin:
@@ -709,10 +820,12 @@ if pay_ref:
     if not isinstance(meta, dict): meta = {}
     tier = meta.get("tier", "")
     expected = PRICE_TIERS.get(tier, {}).get("amount")
-    if ok and expected and pdata.get("amount") == expected and pdata.get("currency", "NGN") == "NGN":
-        pay_email = (pdata.get("customer") or {}).get("email", "")
+    pay_email = str((pdata.get("customer") or {}).get("email", "")).strip().lower()
+    metadata_email = str(meta.get("email", pay_email)).strip().lower()
+    if (ok and expected and pdata.get("amount") == expected and pdata.get("currency") == "NGN"
+            and pay_email and pay_email == metadata_email and str(pdata.get("reference", "")) == str(pay_ref)):
         reg = str(meta.get("reg_no", "")).strip(); title = str(meta.get("project_title", "")).strip()
-        if not reference_used(pay_ref):
+        if reg and title and len(title) <= 300 and len(reg) <= 120 and not reference_used(pay_ref):
             vc = ''.join(random.choices(string.ascii_uppercase+string.digits, k=8))
             saved = save_payment([datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), meta.get("uni",""), meta.get("dept",""), title, vc, pay_email, str(pdata.get("amount",0)), tier, reg, "success", pay_ref])
             payment_rows.clear()
@@ -837,7 +950,7 @@ with c2:
 
 def start_checkout(tier_choice):
     meta = {"reg_no": reg_no.strip(), "project_title": project_title.strip(), "tier": tier_choice,
-            "uni": uni, "dept": dept, "student_name": student_name}
+            "email": student_email.strip().lower(), "uni": uni, "dept": dept, "student_name": student_name}
     track_event("checkout_started", email=student_email, project_key=f"{reg_no}|{project_title}", metadata=tier_choice)
     url, reference = initialize_paystack(student_email.strip(), PRICE_TIERS[tier_choice]["amount"], meta)
     if url:
@@ -966,11 +1079,27 @@ def render_upload_tab():
     with c2: ch3_up=st.file_uploader("Upload Chapter 3 (PDF/DOCX)", type=["pdf","docx"])
     if up:
         try:
-            xls=pd.ExcelFile(up)
+            MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+            MAX_ROWS = 100_000
+            MAX_COLUMNS = 250
+            uploaded_bytes = up.getvalue()
+            if len(uploaded_bytes) > MAX_UPLOAD_BYTES:
+                st.error("This file exceeds the 10 MB upload limit. Please reduce the file size and try again.")
+                return
+            if not uploaded_bytes.startswith(b"PK\x03\x04"):
+                st.error("The uploaded file is not a valid .xlsx workbook.")
+                return
+            xls=pd.ExcelFile(io.BytesIO(uploaded_bytes), engine="openpyxl")
             if 'Data' not in xls.sheet_names or 'Variable_Map' not in xls.sheet_names:
                 st.error("❌ Wrong format! Must have 2 sheets: 'Data' and 'Variable_Map'. Download template above."); return
-            df=pd.read_excel(xls, sheet_name='Data')
-            vmap_df=pd.read_excel(xls, sheet_name='Variable_Map')
+            df=pd.read_excel(xls, sheet_name='Data', engine="openpyxl")
+            vmap_df=pd.read_excel(xls, sheet_name='Variable_Map', engine="openpyxl")
+            if df.empty or df.shape[0] > MAX_ROWS or df.shape[1] > MAX_COLUMNS:
+                st.error("The Data sheet is empty or exceeds the supported limit (100,000 rows and 250 columns).")
+                return
+            if not df.columns.is_unique or any(not str(c).strip() for c in df.columns):
+                st.error("Every data column must have a unique, non-empty name.")
+                return
             if 'Variable_Name' not in vmap_df.columns or 'Role' not in vmap_df.columns:
                 st.error("❌ Variable_Map must have Variable_Name, Role, Type"); return
             dv_rows=vmap_df[vmap_df['Role'].astype(str).str.lower()=='dependent']
@@ -995,7 +1124,11 @@ def render_upload_tab():
                     if 'group' in c.lower() and 2<=df[c].nunique()<=8:
                         gc=c; break
                 st.session_state.group_col=gc
-        except Exception as e: st.error(f"Error: {e}"); return
+        except Exception as e:
+            st.error("We could not read this workbook. Check that it is a valid, uncorrupted Excel template with the required sheets, then try again.")
+            try: track_event("upload_parse_failed", metadata=type(e).__name__)
+            except Exception: pass
+            return
         if ch3_up:
             ch3_text=extract_ch3(ch3_up); ch3_info=parse_ch3(ch3_text); st.session_state.ch3_info=ch3_info
             st.success(f"📘 Methods: {', '.join(ch3_info['methods'])}")
@@ -1085,6 +1218,7 @@ with tab2:
             if 'ANOVA' in infer:
                 st.write(f"**One-Way ANOVA — {infer['ANOVA']['factor']} on {dep_col}**")
                 st.json(infer['ANOVA'])
+                st.caption("Automated output is a statistical aid, not approval that the method matches the design. Check independence, residuals, group sizes, variable coding and your approved analysis plan.")
                 if infer['ANOVA'].get('Levene p-value', 1) < 0.05:
                     st.warning("Group variances may differ. Standard one-way ANOVA/Tukey results require careful review; consider a design-appropriate robust alternative with your supervisor/statistician.")
             if 'PostHoc_Error' in infer:
@@ -1149,168 +1283,92 @@ with tab2:
                 buf=io.BytesIO(); fig.savefig(buf,format='png',dpi=300,bbox_inches='tight'); buf.seek(0)
                 st.download_button(f"🖼️ {name}.png — No Watermark", data=buf, file_name=f"{name}.png", mime="image/png", key=f"dl_{name}")
 
-# ---------------------------------------------------------------- TAB 3
+# ---------------------------------------------------------------- TAB 3 — DISCUSSION ASSISTANT (PROMPTS, NOT GHOSTWRITING)
 with tab3:
     if st.session_state.get("_discussion_opened_event_key") != current_project_key:
         track_event("discussion_opened", email=student_email, project_key=current_project_key)
         st.session_state["_discussion_opened_event_key"] = current_project_key
     if not st.session_state.paid:
-        st.markdown("<div class='locked-box'><h3>🔒 Discuss Locked — Pay to unlock teaching with Consensus, Jenni, PubMed, Google Scholar</h3></div>", unsafe_allow_html=True)
+        st.markdown("<div class='locked-box'><h3>🔒 Discussion support is locked</h3><p>Unlock your project tools through the existing payment workflow.</p></div>", unsafe_allow_html=True)
     else:
-        st.header(f"💬 Discuss — Learn to Discuss Using Similar Articles — Consensus + Jenni + PubMed + Google Scholar — {project_title}")
-        st.info("We teach you to discuss — using real similar articles online as guideline — not AI hallucination — supervisor wants real citations")
-        dep_col = st.session_state.get('auto_dv') or 'Variable'
-        group_col = st.session_state.get('group_col') or 'Group'
-        base_query = f"{project_title} {dep_col} {group_col}".strip()
-        anova_query = f"{dep_col} effect of {group_col} dose response"
-        scholar_query = f"{dep_col} {group_col} experimental study"
-        st.subheader("Step 1 — Find Similar Articles — 5 Sources — One Click")
-        st.caption("Click to open with YOUR project keywords — find 2-3 similar articles to use as guideline — copy Title + Year")
-        r1c1,r1c2,r1c3 = st.columns(3)
-        with r1c1:
-            consensus_url = f"https://consensus.app/search/?q={quote_plus(base_query)}&searchMode=chat"
-            consensus_url2 = f"https://consensus.app/search/?q={quote_plus(anova_query)}"
-            st.markdown(f"""
-<div style="border:2px solid #185ADB; border-radius:12px; padding:12px; background:#F0F7FF; height:190px;">
-<b>🔬 1. Consensus.ai — Yes/No evidence</b><br>
-<span style="font-size:12px;">Does {dep_col} differ by {group_col}?</span><br><br>
-<a href="{consensus_url}" target="_blank" style="background:#185ADB; color:white; padding:8px 14px; border-radius:8px; text-decoration:none; display:inline-block; font-size:13px;">Search Consensus</a><br>
-<a href="{consensus_url2}" target="_blank" style="background:white; color:#185ADB; border:1px solid #185ADB; padding:5px 10px; border-radius:8px; text-decoration:none; display:inline-block; margin-top:6px; font-size:11px;">{anova_query[:32]}</a>
-</div>
-""", unsafe_allow_html=True)
-        with r1c2:
-            pubmed_url = f"https://pubmed.ncbi.nlm.nih.gov/?term={quote_plus(base_query)}&sort=date"
-            pubmed_url2 = f"https://pubmed.ncbi.nlm.nih.gov/?term={quote_plus(str(dep_col) + ' ' + str(group_col))}"
-            st.markdown(f"""
-<div style="border:2px solid #0F766E; border-radius:12px; padding:12px; background:#F0FDFA; height:190px;">
-<b>🧬 2. PubMed — Biomedical — Free full text</b><br>
-<span style="font-size:12px;">Best for Rat/Physiology/Med/Nursing</span><br><br>
-<a href="{pubmed_url}" target="_blank" style="background:#0F766E; color:white; padding:8px 14px; border-radius:8px; text-decoration:none; display:inline-block; font-size:13px;">Search PubMed</a><br>
-<a href="{pubmed_url2}" target="_blank" style="background:white; color:#0F766E; border:1px solid #0F766E; padding:5px 10px; border-radius:8px; text-decoration:none; display:inline-block; margin-top:6px; font-size:11px;">{dep_col} + {group_col}</a>
-</div>
-""", unsafe_allow_html=True)
-        with r1c3:
-            scholar_url = f"https://scholar.google.com/scholar?q={quote_plus(scholar_query)}&as_ylo=2018"
-            scholar_url2 = f"https://scholar.google.com/scholar?q={quote_plus(base_query)}"
-            st.markdown(f"""
-<div style="border:2px solid #1E40AF; border-radius:12px; padding:12px; background:#EFF6FF; height:190px;">
-<b>📚 3. Google Scholar — Most cited — All fields</b><br>
-<span style="font-size:12px;">Find highly cited similar articles</span><br><br>
-<a href="{scholar_url}" target="_blank" style="background:#1E40AF; color:white; padding:8px 14px; border-radius:8px; text-decoration:none; display:inline-block; font-size:13px;">Search Google Scholar</a><br>
-<a href="{scholar_url2}" target="_blank" style="background:white; color:#1E40AF; border:1px solid #1E40AF; padding:5px 10px; border-radius:8px; text-decoration:none; display:inline-block; margin-top:6px; font-size:11px;">All years — {base_query[:22]}</a>
-</div>
-""", unsafe_allow_html=True)
-        r2c1,r2c2,r2c3 = st.columns(3)
-        with r2c1:
-            jenni_url = "https://app.jenni.ai"
-            semantic_url = f"https://www.semanticscholar.org/search?q={quote_plus(base_query)}&sort=relevance"
-            st.markdown(f"""
-<div style="border:2px solid #7C3AED; border-radius:12px; padding:12px; background:#F5F0FF; height:190px;">
-<b>✍️ 4. Jenni.ai — Write with citations</b><br>
-<span style="font-size:12px;">Import articles from Consensus/PubMed/Scholar → Jenni cites them</span><br><br>
-<a href="{jenni_url}" target="_blank" style="background:#7C3AED; color:white; padding:8px 14px; border-radius:8px; text-decoration:none; display:inline-block; font-size:13px;">Open Jenni.ai</a><br>
-<a href="{semantic_url}" target="_blank" style="background:white; color:#7C3AED; border:1px solid #7C3AED; padding:5px 10px; border-radius:8px; text-decoration:none; display:inline-block; margin-top:6px; font-size:11px;">Semantic Scholar too</a>
-</div>
-""", unsafe_allow_html=True)
-        with r2c2:
-            st.markdown(f"""
-<div style="border:1px solid #eee; border-radius:12px; padding:12px; background:white; height:190px;">
-<b>📝 How to use 5 sources together (Teaching)</b><br>
-<span style="font-size:12px; line-height:1.5;">
-                        1. <b>Consensus</b> → Quick Yes/No: Does dose affect {dep_col}?<br>
-                        2. <b>PubMed</b> → Rat studies — copy MeSH terms<br>
-                        3. <b>Google Scholar</b> → Most cited — check References list<br>
-                        4. <b>Copy 2 titles</b> → e.g. Ade et al. 2020<br>
-                        5. <b>Jenni</b> → Paste titles → Jenni inserts (Ade et al., 2020)<br>
-                        6. <b>Tab 4</b> → Format into APA 7th etc. — citations intact
-</span>
-</div>
-""", unsafe_allow_html=True)
-        with r2c3:
-            st.markdown(f"""
-<div style="background:#FFFDE7; border:1px solid #F9A825; border-radius:12px; padding:12px; height:190px;">
-<b>🎓 Supervisor Formula — 4 Paras — Using Similar Articles</b><br>
-<span style="font-size:12px; line-height:1.5;">
-<b>P1 What found:</b> Mean {dep_col}=X, ANOVA Sig=0.000<br>
-<b>P2 Compare:</b> Agrees with PubMed article Ade 2020... Differs from Scholar article Bola 2021...<br>
-<b>P3 Why:</b> Agreement due to similar dose; Difference due to strain<br>
-<b>P4 Implication:</b> Suggests {dep_col} responsive<br>
-<i>Use 2-3 real articles — not fake</i>
-</span>
-</div>
-""", unsafe_allow_html=True)
-        st.divider()
-        st.subheader("Step 2 — Paste Similar Articles You Found — Then Generate Discussion")
-        cA,cB = st.columns(2)
-        with cA:
-            main_finding = st.text_area("Your Main Finding from Tab 2 — ANOVA Sig, Tukey", height=90, value=f"ANOVA for {dep_col} by {group_col} significant Sig=0.000, Tukey Control vs High Dose Sig=0.000" if group_col else "")
-            similar_articles = st.text_area("Paste 2-3 Similar Articles from PubMed / Scholar / Consensus — Copy Title + Authors + Year", height=150, placeholder="From PubMed:\n1. Ade J, et al. (2020). Effect of extract on weight in Wistar rats. J Physiol...\nFrom Google Scholar:\n2. Bola S et al. (2021). High dose effect on glucose...\nFrom Consensus:\n3. ...")
-        with cB:
-            objective = st.text_area("Objective from Chapter 1", height=90)
-            study_type_note = st.selectbox("Study type for discussion tone", ["Experimental Rat Study","Human Survey/Clinical","Other"])
-        if st.button("Generate Discussion Draft Using Your Supplied Sources", type="primary", use_container_width=True):
-            st.session_state["discussion_sources_reviewed"] = bool(similar_articles.strip())
-            mean_line = ""
-            try:
-                if 'df' in st.session_state and dep_col in st.session_state.df.columns:
-                    s = pd.to_numeric(st.session_state.df[dep_col], errors='coerce').dropna()
-                    if len(s)>0:
-                        mean_line = f"Descriptive analysis revealed mean {dep_col} = {s.mean():.2f} ± {s.std():.2f}."
-            except: pass
-            anova_line = "ANOVA showed significant difference."
-            try:
-                if 'df' in st.session_state:
-                    ch3 = st.session_state.get('ch3_info',{"methods":[]})
-                    infer_temp = run_inferential_correct_order(st.session_state.df, dep_col, st.session_state.get('auto_ivs',[]), st.session_state.get('group_col'), ch3['methods'])
-                    if 'ANOVA' in infer_temp:
-                        anova_line = f"One-way ANOVA showed significant difference in {dep_col} across {infer_temp['ANOVA']['factor']} (F={infer_temp['ANOVA']['F']}, p={infer_temp['ANOVA']['Sig.']}). Review the post-hoc output before describing specific group differences."
-            except: pass
-            refs_guideline = similar_articles.strip() if similar_articles.strip() else "No article details were supplied. Add verified article titles, authors, years, and DOI/URLs before making literature comparisons."
-            draft = f"""CHAPTER FIVE — DISCUSSION — {project_title.upper()}
-
-This {study_type_note.lower()} was conducted at {uni}, Department of {dept}, to investigate {objective if objective else project_title}. {mean_line}
-
-{anova_line} Main finding: {main_finding}.
-
-Comparison with similar articles as guideline (from PubMed, Google Scholar, Consensus.ai):
-Source notes supplied for checking: {refs_guideline}. Do not claim agreement or disagreement with prior studies until each source has been opened and its methods and findings verified. Insert only comparisons that are supported by the cited article text.
-
-How to write this with Jenni.ai (Teaching):
-1. Open https://app.jenni.ai → New document: Discussion {dep_col}
-2. Go to PubMed link above → Copy DOI/title of 2 articles → Paste into Jenni library (Jenni auto-fetches citation)
-3. Go to Google Scholar link → Copy 1 highly cited article → Add to Jenni
-4. In Jenni, type: "Discuss my finding: {main_finding} in relation to [{refs_guideline[:60]}] — {dep_col} by {group_col} — experimental rat study"
-5. Jenni will insert citations: (Ade et al., 2020) — keep them intact — our Tab 4 Formatter preserves them with 10+ styles (APA 7th, Vancouver, etc.)
-6. Copy Jenni output back here → Download → Then format in Tab 4
-
-Implication:
-Significant difference between Control and High Dose suggests {dep_col} is responsive to intervention, with potential translational relevance as suggested by PubMed biomedical literature.
-
-Conclusion:
-Objective achieved. Descriptive by group, ANOVA, Tukey confirm {dep_col} varies by {group_col}. Similar articles from PubMed/Google Scholar/Consensus provide guideline for interpretation.
-
-References for discussion (from your similar articles — format in Tab 4 with 10+ styles):
-{refs_guideline}
-"""
-            st.session_state["discussion_guideline_full"] = draft   # set BEFORE the text_area below is created
-
-        if "discussion_guideline_full" in st.session_state:
-            st.text_area("Edit final discussion — Keep citations intact — Will be preserved in Tab 4 with 10+ styles", height=450, key="discussion_guideline_full")
-            ddoc = docx.Document()
-            dstyle = ddoc.styles['Normal']; dstyle.font.name="Times New Roman"; dstyle.font.size=Pt(12); dstyle.paragraph_format.line_spacing=Pt(18)
-            for para_text in st.session_state["discussion_guideline_full"].split("\n\n"):
-                if para_text.strip():
-                    ddoc.add_paragraph(para_text.strip())
-            dbio = io.BytesIO(); ddoc.save(dbio)
-            st.download_button("📄 Download Discussion — With PubMed + Scholar + Consensus Guideline — No Watermark — Citations Intact", dbio.getvalue(), f"{reg_no}_Discussion_PubMed_Scholar_Consensus_Jenni.docx", use_container_width=True)
-            st.success("Discussion uses YOUR similar articles from PubMed/Google Scholar/Consensus as guideline — not fake — ready for Tab 4 formatting into APA 7th/Vancouver etc.")
-        st.divider()
-        st.markdown(f"""
-<div style="text-align:center; font-size:12px; color:gray;">
-<b>Research Base HQ workflow with 5 sources:</b><br>
-        Research Base HQ (Descriptive → Group → ANOVA → Tukey correct order) → PubMed (biomedical) + Google Scholar (most cited) + Consensus.ai (Yes/No) → Copy 2-3 real articles → Jenni.ai (writes discussion with those citations intact) → Research Base HQ Tab 4 (formats References into 10+ styles — APA 7th, Vancouver, Harvard etc.) — No watermark<br>
-</div>
-""", unsafe_allow_html=True)
+        st.header(f"💬 Discussion Assistant — {project_title}")
+        st.info("Evidence first, suggestions second. This assistant does not write a complete Chapter Five. Use your verified results and sources, then develop the argument in your own words.")
+        df = st.session_state.get("df")
+        if df is None:
+            st.warning("Upload your dataset in Tab 1 and complete the analysis plan in Tab 2 first. The discussion assistant will not invent results.")
+        else:
+            dep_col = st.session_state.get("auto_dv") or df.columns[0]
+            group_col = st.session_state.get("group_col")
+            available = list(df.columns)
+            dep_col = st.selectbox("Outcome / dependent variable", available, index=available.index(dep_col) if dep_col in available else 0, key="discussion_dv")
+            group_options = ["None"] + [c for c in available if c != dep_col]
+            default_group = group_col if group_col in group_options else "None"
+            group_col = st.selectbox("Grouping variable (if relevant)", group_options, index=group_options.index(default_group), key="discussion_group")
+            if group_col == "None": group_col = None
+            st.subheader("1. Review the actual result")
+            result_rows = []
+            series = pd.to_numeric(df[dep_col], errors="coerce")
+            valid = series.dropna()
+            if len(valid):
+                result_rows.append({"Item":"Outcome summary", "Observed result":f"N valid = {len(valid)}; missing/non-numeric = {int(series.isna().sum())}; mean = {valid.mean():.3f}; SD = {valid.std(ddof=1):.3f}; median = {valid.median():.3f}; range = {valid.min():.3f} to {valid.max():.3f}"})
+            if group_col and group_col in df.columns:
+                grouped = df[[group_col, dep_col]].copy()
+                grouped[dep_col] = pd.to_numeric(grouped[dep_col], errors="coerce")
+                grouped = grouped.dropna()
+                if not grouped.empty:
+                    st.markdown("**Descriptive results by group (not an inferential test):**")
+                    st.dataframe(grouped.groupby(group_col)[dep_col].agg(N="count", Mean="mean", SD="std", Median="median", Minimum="min", Maximum="max").round(3), use_container_width=True)
+                    result_rows.append({"Item":"Group comparison", "Observed result":"Group summaries shown above. A difference in means alone does not establish statistical significance or causation."})
+            st.subheader("2. Build your discussion point by point")
+            finding = st.text_area("State the specific finding you want to discuss", placeholder="Example: The mean outcome was higher in Group B than in the control group. Add the exact group values and the relevant test output from Tab 2.", height=90, key="discussion_finding")
+            stats_note = st.text_area("Paste the relevant test output from Tab 2 (test statistic, degrees of freedom if available, p-value, effect size and post-hoc result)", height=110, key="discussion_stats_note")
+            objective = st.text_area("Which study objective or hypothesis does this finding address?", height=75, key="discussion_objective")
+            sources = st.text_area("Verified literature notes (authors, year, title, DOI/URL and the specific finding from the paper)", height=120, placeholder="Paste details from articles you have opened and checked. The app does not verify a citation just because it is pasted here.", key="discussion_sources")
+            limitations = st.text_area("Possible limitations or alternative explanations to consider", height=75, placeholder="For example: sample size, measurement error, confounding, study design, or limited generalisability—include only what applies to your study.", key="discussion_limitations")
+            if st.button("Create discussion prompts from my inputs", type="primary", use_container_width=True):
+                if not finding.strip():
+                    st.warning("Enter a specific finding first. The app will not generate a discussion point without one.")
+                else:
+                    prompts = [
+                        f"Finding to explain: {finding.strip()}",
+                        "Interpretation: What does this result support in relation to your stated objective? What does it not prove?",
+                        "Statistical evidence: State the exact test statistic, p-value, confidence interval and effect size where available. Do not write p = 0.000; report it as p < 0.001 when that is what the software output supports.",
+                        "Biological/theoretical explanation: What plausible mechanism could explain this result? Find a reliable source before presenting a mechanism as established fact.",
+                        "Literature comparison: Does a verified study agree or disagree? Compare population/model, design, dose/exposure, measurements and results rather than comparing titles alone.",
+                        "Limitations: Could sample size, design, measurement, confounding or other limitations affect interpretation? Include only limitations that genuinely apply.",
+                        "Implication: What cautious implication follows from the evidence, and what would require further research? Avoid claims of causation or clinical relevance unless the design supports them."
+                    ]
+                    if not stats_note.strip(): prompts.insert(1, "Missing evidence: add the relevant test output before making claims about statistical significance.")
+                    if not sources.strip(): prompts.append("Literature gap: no verified literature notes were supplied. Search for relevant papers and read the methods/results before comparing studies; do not invent citations.")
+                    if limitations.strip(): prompts.append("Your limitation notes to assess: " + limitations.strip())
+                    st.session_state["discussion_prompt_result"] = prompts
+                    track_event("discussion_prompts_created", email=student_email, project_key=current_project_key)
+            prompts = st.session_state.get("discussion_prompt_result", [])
+            if prompts:
+                st.subheader("Your discussion planning card")
+                for i, prompt in enumerate(prompts, 1):
+                    st.markdown(f"**{i}.** {prompt}")
+                student_draft = st.text_area("Now write your own discussion paragraph", height=180, key="student_discussion_draft", placeholder="Use the prompts above to write your own explanation, compare verified studies and cite the sources you have checked.")
+                if st.button("Review my draft", use_container_width=True):
+                    feedback=[]
+                    if len(student_draft.split()) < 80: feedback.append("Your draft is short. Consider addressing the finding, interpretation, comparison with literature, and limitations where relevant.")
+                    if not re.search(r"\b(p\s*[<=>]|p-value|confidence interval|effect size|F\s*=|t\s*=|r\s*=)\b", student_draft, re.I): feedback.append("Check whether the statistical evidence should be reported. Use exact values from your output; do not invent them.")
+                    if not re.search(r"\b(19|20)\d{2}\b", student_draft): feedback.append("No publication year was detected. Add citations only for sources you have verified; this simple check does not verify references.")
+                    if re.search(r"\b(proves conclusively|undoubtedly proves|100% proves)\b", student_draft, re.I): feedback.append("Avoid absolute language. Statistical results rarely prove a hypothesis conclusively.")
+                    if not sources.strip(): feedback.append("You have not entered verified literature notes. Add and check relevant sources before making claims about agreement or disagreement with previous studies.")
+                    if not limitations.strip(): feedback.append("Consider whether a genuine study limitation affects interpretation; do not add generic limitations that do not apply.")
+                    if not feedback: feedback.append("No basic checklist flags were triggered. This is not a verification of statistical correctness, citation validity or scientific accuracy.")
+                    st.session_state["discussion_draft_feedback"] = feedback
+                for item in st.session_state.get("discussion_draft_feedback", []): st.write("- " + item)
+                st.download_button("Download discussion planning notes", "RESEARCH BASE HQ — DISCUSSION PLANNING NOTES\n\n" + "\n".join(f"{i}. {p}" for i,p in enumerate(prompts,1)) + "\n\nStudent draft:\n" + st.session_state.get("student_discussion_draft", ""), file_name="discussion_planning_notes.txt", mime="text/plain")
+            st.divider()
+            st.subheader("Find relevant literature")
+            search_query = f"{project_title} {dep_col} {group_col or ''}".strip()
+            c1,c2,c3 = st.columns(3)
+            c1.markdown(f"[Search PubMed](https://pubmed.ncbi.nlm.nih.gov/?term={quote_plus(search_query)})")
+            c2.markdown(f"[Search Google Scholar](https://scholar.google.com/scholar?q={quote_plus(search_query)})")
+            c3.markdown(f"[Search Semantic Scholar](https://www.semanticscholar.org/search?q={quote_plus(search_query)})")
+            st.caption("These links open search results; they do not verify any article. Read the paper and confirm the citation details before using it.")
 
 # ---------------------------------------------------------------- TAB 4
 with tab4:
@@ -1493,6 +1551,16 @@ with tab6:
             for item in result["feedback"]: st.write("- " + item)
             st.warning("Edit for accuracy, clarity, your own analysis and correct citations. Do not change wording merely to evade AI-detection systems.")
             st.download_button("Download review notes", "WRITING QUALITY REVIEW\n\n" + "\n".join("- " + x for x in result["feedback"]), file_name="ResearchBaseHQ_Writing_Review.txt", mime="text/plain")
+# ---------------------------------------------------------------- SAFE PROJECT PROGRESS SNAPSHOT
+try:
+    if "current_project_key" in globals() and current_project_key:
+        _snapshot_state = {"stage": st.session_state.get("_last_completed_stage", "project_started"), "analysis_confirmed": st.session_state.get("analysis_confirmed", False), "confirmed_methods": st.session_state.get("confirmed_methods", []), "selected_university_format": st.session_state.get("selected_university_format", "")}
+        save_project_snapshot(current_project_key, student_email if "student_email" in globals() else "", project_title if "project_title" in globals() else "", _snapshot_state)
+    if st.session_state.get("snapshot_warning"):
+        st.caption(st.session_state["snapshot_warning"])
+except Exception:
+    pass
+
 # ---------------------------------------------------------------- FOOTER
 st.divider()
 st.markdown(f"""
